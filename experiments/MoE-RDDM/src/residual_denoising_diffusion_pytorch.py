@@ -822,9 +822,12 @@ class ResidualDiffusion(nn.Module):
         self.condition = condition
         self.input_condition = input_condition
         self.input_condition_mask = input_condition_mask
+        self.last_print_step = -1
+        self.last_expert_prior_loss = None
+        self.last_expert_prior_weight = None
         # 【新增代码】：当开启 input_condition 时，初始化软决策树
         if self.input_condition:
-            self.sdt = SoftDecisionTree(in_channels=self.channels,  img_size=image_size)
+            self.sdt = SoftDecisionTree(in_channels=self.channels, num_experts=4)
 
         if self.condition:
             self.sum_scale = sum_scale if sum_scale else 0.01
@@ -840,53 +843,41 @@ class ResidualDiffusion(nn.Module):
         betas2_cumsum = betas2.cumsum(dim=0).clip(0, 1)
         betas_cumsum = torch.sqrt(betas2_cumsum)
         betas2_cumsum_prev = F.pad(betas2_cumsum[:-1], (1, 0), value=1.)
-        posterior_variance = betas2*betas2_cumsum_prev/betas2_cumsum
+        posterior_variance = betas2 * betas2_cumsum_prev / betas2_cumsum
         posterior_variance[0] = 0
 
         timesteps, = alphas.shape
         self.num_timesteps = int(timesteps)
         self.loss_type = loss_type
 
-        # sampling related parameters
-        # default num sampling timesteps to number of timesteps at training
         self.sampling_timesteps = default(sampling_timesteps, timesteps)
-
         assert self.sampling_timesteps <= timesteps
         self.is_ddim_sampling = self.sampling_timesteps < timesteps
         self.ddim_sampling_eta = ddim_sampling_eta
 
-        def register_buffer(name, val): return self.register_buffer(
-            name, val.to(torch.float32))
+        def register_buffer(name, val):
+            return self.register_buffer(name, val.to(torch.float32))
 
         register_buffer('alphas', alphas)
         register_buffer('alphas_cumsum', alphas_cumsum)
-        register_buffer('one_minus_alphas_cumsum', 1-alphas_cumsum)
+        register_buffer('one_minus_alphas_cumsum', 1 - alphas_cumsum)
         register_buffer('betas2', betas2)
         register_buffer('betas', torch.sqrt(betas2))
         register_buffer('betas2_cumsum', betas2_cumsum)
         register_buffer('betas_cumsum', betas_cumsum)
-        register_buffer('posterior_mean_coef1',
-                        betas2_cumsum_prev/betas2_cumsum)
-        register_buffer('posterior_mean_coef2', (betas2 *
-                        alphas_cumsum_prev-betas2_cumsum_prev*alphas)/betas2_cumsum)
-        register_buffer('posterior_mean_coef3', betas2/betas2_cumsum)
+        register_buffer('posterior_mean_coef1', betas2_cumsum_prev / betas2_cumsum)
+        register_buffer('posterior_mean_coef2', (betas2 * alphas_cumsum_prev - betas2_cumsum_prev * alphas) / betas2_cumsum)
+        register_buffer('posterior_mean_coef3', betas2 / betas2_cumsum)
         register_buffer('posterior_variance', posterior_variance)
-        register_buffer('posterior_log_variance_clipped',
-                        torch.log(posterior_variance.clamp(min=1e-20)))
+        register_buffer('posterior_log_variance_clipped', torch.log(posterior_variance.clamp(min=1e-20)))
 
         self.posterior_mean_coef1[0] = 0
         self.posterior_mean_coef2[0] = 0
         self.posterior_mean_coef3[0] = 1
         self.one_minus_alphas_cumsum[-1] = 1e-6
 
-        # ================================================
-        # 🚀 Stage 2 专属：高阶损失开关设定 (默认先不加载，省显存)
-        # ================================================
-        self.use_stage2_loss = False
-        self.bfr_loss_fn = None
-        self.last_print_step = -1
-        self.last_expert_prior_loss = None
-        self.last_expert_prior_weight = None
+
+
 
     def predict_noise_from_res(self, x_t, t, x_input, pred_res):
         return (
@@ -1211,7 +1202,8 @@ class ResidualDiffusion(nn.Module):
             return 0.15 - (current_step - 15000) * (0.12 / 15000.0)
         else:
             return 0.01
-    def p_losses(self, imgs, t, noise=None, current_step=0, total_steps=80000):
+    def p_losses(self, imgs, t, noise=None, current_step=0, total_steps=None):
+        total_steps = 20000 if total_steps is None else total_steps
 
         if isinstance(imgs, list):  # Condition
             x_start = imgs[0]
@@ -1376,18 +1368,16 @@ class ResidualDiffusion(nn.Module):
                 # -----------------------------
                 bal_loss = 4.0 * torch.sum((mean_probs - 0.25) ** 2)
 
-                if getattr(self, 'use_stage2_loss', False):
-                    bal_weight = 0.0001
-                else:
-                    base_bal_weight = 0.01
+                
+                base_bal_weight = 0.01
 
-                    if current_step < 6000:
-                        bal_weight = base_bal_weight
-                    elif current_step < 14000:
-                        alpha = (current_step - 6000) / float(14000 - 6000)
-                        bal_weight = base_bal_weight * (1.0 - 0.7 * alpha)
-                    else:
-                        bal_weight = base_bal_weight * 0.15
+                if current_step < 6000:
+                    bal_weight = base_bal_weight
+                elif current_step < 14000:
+                    alpha = (current_step - 6000) / float(14000 - 6000)
+                    bal_weight = base_bal_weight * (1.0 - 0.7 * alpha)
+                else:
+                    bal_weight = base_bal_weight * 0.15
 
                 if current_step % 1000 == 0 and current_step != self.last_print_step:
                     print(
@@ -1403,39 +1393,7 @@ class ResidualDiffusion(nn.Module):
                 self.last_expert_prior_loss = None
                 self.last_expert_prior_weight = None
 
-        # ==========================================================
-        # 🚀 BFR Stage 2 核心约束：重构 x_0 并计算 Identity & Perceptual
-        # ==========================================================
-        if self.use_stage2_loss and self.bfr_loss_fn is not None:
-            # 1. 逆向推导网络心目中的清晰原图 (\hat{x}_0)
-            if self.objective == 'pred_res_noise':
-                pred_x_start = x_input - pred_res
-            elif self.objective == 'pred_noise':
-                pred_x_start = self.predict_start_from_xinput_noise(x, t, x_input, pred_noise)
-            elif self.objective == 'pred_x0_noise' or self.objective == 'pred_x0_add_noise':
-                pred_x_start = model_out[0]
-            else:
-                pred_x_start = x_input - pred_res  # 兜底逻辑
 
-            pred_x_start = torch.clamp(pred_x_start, -1.0, 1.0)
-
-            # 2. 拿到向量化的 Loss (此时 lpips 为 [B,1,1,1] 或类似, id 为 [B])
-            loss_lpips, loss_id = self.bfr_loss_fn(pred_x_start, x_start)
-
-            # 3. 计算一维的时间权重 [B]
-            t_weight_1d = 1.0 - (t.float() / self.num_timesteps)
-
-            # 4. 🚨 严格对齐维度进行逐样本加权，最后再求均值！
-            # 对 lpips: 展开为 [B, 1, 1, 1] 相乘
-            weighted_lpips = (loss_lpips * t_weight_1d.view(-1, 1, 1, 1)).mean()
-
-            # 对 face_id: 直接作为一维 [B] 相乘
-            weighted_id = (loss_id * t_weight_1d.view(-1)).mean()
-
-            # 5. 组装并施加惩罚 (权重系数 0.1 可调)
-            stage2_loss = 0.1 * weighted_lpips + 0.1 * weighted_id
-
-            total_loss = total_loss + stage2_loss
 
         return total_loss
 
@@ -1809,8 +1767,16 @@ class Trainer(object):
                 x_input_sample, batch_size=batches, last=last))
 
             final_output = sampled_outputs[-1]  # 模型修复结果
-            corrupted_input = show_x_input_sample[-1]  # 模型输入的原图
-
+            
+            if self.condition_type == 2:
+                corrupted_input = show_x_input_sample[1]
+            elif self.condition_type == 3:
+                corrupted_input = show_x_input_sample[1]
+            elif len(show_x_input_sample) > 0:
+                corrupted_input = show_x_input_sample[-1]
+            else:
+                corrupted_input = final_output
+            
             # =======================================================
             # 🚀 新增：计算并记录 Validation Metrics
             # =======================================================
@@ -1824,22 +1790,6 @@ class Trainer(object):
                 psnr = -10 * torch.log10(mse + 1e-8) if mse > 0 else torch.tensor(100.0)
                 self.writer.add_scalar('Metrics_Validation/PSNR', psnr.item(), self.step)
 
-                # 2. 计算 LPIPS & ID Cosine (调用你之前挂载的 Stage 2 专家 Loss)
-                # 🚀 突破防御：剥离 DDP 封装壳，提取真实底层模型
-                unwrapped_model = self.accelerator.unwrap_model(self.model)
-                # 因为你的 BFR_Stage2_Loss 已经在 train.py 初始化并挂载到了 diffusion_model(即 self.model)
-                if hasattr(unwrapped_model, 'use_stage2_loss') and getattr(unwrapped_model, 'use_stage2_loss', False):
-                    if unwrapped_model.bfr_loss_fn is not None:
-                        # 转换范围 [0, 1] 到 [-1, 1] 以适配 VGG 和 FaceNet
-                        pred_x0_neg1 = final_output * 2.0 - 1.0
-                        gt_x0_neg1 = gt_img * 2.0 - 1.0
-
-                        # 直接调用底层算子打分
-                        lpips_val, id_loss = unwrapped_model.bfr_loss_fn(pred_x0_neg1, gt_x0_neg1)
-                        id_cosine = 1.0 - id_loss.mean().item()
-
-                        self.writer.add_scalar('Metrics_Validation/LPIPS', lpips_val.mean().item(), self.step)
-                        self.writer.add_scalar('Metrics_Validation/ID_Cosine', id_cosine, self.step)
 
 
             # 计算放大 10 倍的残差
@@ -1876,7 +1826,7 @@ class Trainer(object):
                 else:
                     file_name = f'{i}.png'
                 print(f"[Test] [{i + 1:04d}/{len(self.sample_dataset):04d}] -> {file_name}")
-                i += 1
+                
 
                 with torch.no_grad():
                     batches = self.num_samples
@@ -1915,6 +1865,7 @@ class Trainer(object):
                                           pad_size[0], 0:w-pad_size[1]]
                                 all_images_list[k] = img
                                 k += 1
+                        
 
                 all_images = torch.cat(all_images_list, dim=0)
 
@@ -1926,6 +1877,7 @@ class Trainer(object):
                 utils.save_image(all_images, str(
                     self.results_folder / file_name), nrow=nrow)
                 print("test-save "+file_name)
+                i += 1
         else:
             if FID:
                 self.total_n_samples = 50000

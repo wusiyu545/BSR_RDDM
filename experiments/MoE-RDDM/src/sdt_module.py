@@ -5,7 +5,7 @@ import random
 import torch.nn.functional as F
 
 class SoftDecisionTree(nn.Module):
-    def __init__(self, in_channels=3, img_size=512, num_experts=4):
+    def __init__(self, in_channels=3, num_experts=4):
         super(SoftDecisionTree, self).__init__()
 
         # --- 多尺度截断特征提取 ---
@@ -48,7 +48,9 @@ class SoftDecisionTree(nn.Module):
         self.last_progress = None
         self.last_stage = None
 
-    def forward(self, x, current_step=0, total_steps=80000):
+    def forward(self, x, current_step=0, total_steps=20000):
+        # total_steps 应与 train.py 中的 train_num_steps 保持一致
+
         # 1. 特征提取与融合
         f1 = self.stage1_2(x)
         f2 = self.stage3_4(f1)
@@ -105,7 +107,7 @@ class SoftDecisionTree(nn.Module):
 
         # 随机打印监控 (1% 概率)
 
-        if random.random() < 0.01:
+        if random.random() < 0.002:
             print(f"\n[SDT 监控 | 进度:{progress * 100:.1f}% | 阶段:{stage_name} | Temp:{temp:.3f}] "
                   f"W1:{weights[0, 0].item():.2f}, W2:{weights[0, 1].item():.2f}, "
                   f"W3:{weights[0, 2].item():.2f}, W4:{weights[0, 3].item():.2f}")
@@ -138,10 +140,8 @@ def get_sdt_probs(sdt, num_experts=4, is_logits=False):
         if is_logits:
             return F.softmax(sdt, dim=-1)
         else:
-            # 默认传入的已经是概率 (例如你上方类的输出)
-            # 施加 clamp 防御性下界限制，杜绝由于 AMP(混合精度) 或极端梯度导致的 0 值
             sdt = sdt.clamp_min(1e-8)
-            # 强制重归一化，确保概率和绝对为 1.0
-            return sdt / sdt.sum(dim=-1, keepdim=True)
+            den = sdt.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+            return sdt / den
 
     raise ValueError(f"Unsupported SDT shape: {sdt.shape}")

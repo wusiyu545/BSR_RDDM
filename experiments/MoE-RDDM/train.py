@@ -12,8 +12,7 @@ from src.residual_denoising_diffusion_pytorch import (ResidualDiffusion,
                                                       set_seed)
 
 AUTO_RESUME = False          # 是否自动恢复最新checkpoint
-RESUME_MILESTONE = False      # 手动指定恢复的权重，如 2 表示 model-2.pt
-AUTO_TEST_LOAD_LATEST = False
+RESUME_MILESTONE = None      # 手动指定恢复的权重，如 2 表示 model-2.pt
 TEST_MILESTONE = None        # 手动指定测试权重，如 2 表示 model-2.pt
 
 # init
@@ -64,7 +63,7 @@ if condition:
         f"{base_path}/test_input.flist"
     ]
     train_batch_size = 1
-    num_samples = 4
+    num_samples = 1
     sum_scale = 0.01
     image_size = 256
 else:
@@ -111,52 +110,14 @@ if __name__ == "__main__":
         with open(folder[2], 'r', encoding='utf-8') as f:
             print(f"DEBUG: 验证集图片数量：{len([line for line in f.readlines() if line.strip()])}")
     except FileNotFoundError:
-        print("⚠️ 警告：找不到 test.flist 文件！")
+        print("⚠️ 警告：找不到 test_gt.flist 文件！")
 
-    # =========================================================
-    # 🚀 BFR 全自动控制台：智能感知进度，无缝切换 Stage
-    # =========================================================
-    # ⚠️ 这里的缩进已经修复，确保它在所有情况下都能正常执行
-    import glob
-    import re
+    
 
-    STAGE2_START_STEP = 999999  # 设定自动开启 Stage 2 的触发步数
-    current_best_step = 0
-    results_dir = './results/MoE_SDT_Stage1_Debug'
+    
 
-    # 1. 发射雷达：扫描 checkpoints，探测当前进度
-    if os.path.exists(results_dir):
-        model_files = glob.glob(f"{results_dir}/model-*.pt")
-        if len(model_files) > 0:
-            milestones = [int(re.findall(r'model-(\d+)\.pt', f)[0]) for f in model_files if
-                          re.findall(r'model-(\d+)\.pt', f)]
-            best_milestone = max(milestones) if milestones else 0
-            current_best_step = best_milestone * save_and_sample_every
+    results_dir = './results/MoE_SDT_BlindSR_x4'
 
-    # 2. 自动裁决：该用哪个 Stage？
-    training_stage = 2 if current_best_step >= STAGE2_START_STEP else 1
-
-    # 3. 自适应硬件与网络加载
-    # 3. 自适应硬件与网络加载
-    if training_stage == 2:
-        print(f"\n🔥 [自动感知] 当前进度 ({current_best_step} 步) 已达到 Stage 2 要求！")
-        print("🔥 [高阶开启] 自动启动人脸保真微调：显式加载 LPIPS & FaceID 约束！")
-
-        # 🚀 极致懒加载：只有真正需要跑 Stage 2 时，才向环境中索要这两个大模型包
-        from src.bfr_loss import BFR_Stage2_Loss
-
-        diffusion.use_stage2_loss = True
-        diffusion.bfr_loss_fn = BFR_Stage2_Loss(device='cuda')
-
-        # 自动调整硬件负载，规避显存爆炸
-        train_batch_size = max(1, train_batch_size // 2)
-        gradient_accumulate_every = gradient_accumulate_every * 2
-        print(f"   -> 硬件保护触发：Batch Size 自动缩放至 {train_batch_size}, 梯度累加至 {gradient_accumulate_every}")
-    else:
-        print(f"\n🌱 [自动感知] 当前进度 ({current_best_step} 步)，未达到 Stage 2 阈值 ({STAGE2_START_STEP})。")
-        print("🌱 [基础构建] 自动执行 Stage 1：基础去噪与专家路由分化训练。")
-
-    # =========================================================
 
     trainer = Trainer(
         diffusion,
@@ -173,7 +134,7 @@ if __name__ == "__main__":
         condition=condition,
         save_and_sample_every=save_and_sample_every,
         equalizeHist=False,
-        crop_patch=False,
+        crop_patch=True,
         generation=False,
         results_folder=results_dir # 统一使用 results_dir
     )
@@ -212,5 +173,5 @@ if __name__ == "__main__":
             print(f"\n✅ [测试准备] 正在加载最终权重 model-{best_milestone}.pt 进行跑分测试...")
             trainer.load(best_milestone)
 
-        trainer.set_results_folder('./results/test_timestep_' + str(sampling_timesteps))
+        trainer.set_results_folder('./results/MoE_SDT_BlindSR_x4_test_timestep_' + str(sampling_timesteps))
         trainer.test(last=True)
