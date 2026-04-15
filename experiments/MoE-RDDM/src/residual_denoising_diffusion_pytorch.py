@@ -1496,7 +1496,7 @@ class Trainer(object):
                 self.condition_type = 2
                 # test_gt+test_input
                 ds = dataset(folder[2:4], self.image_size,
-                             augment_flip=False, convert_image_to=convert_image_to, condition=1, equalizeHist=equalizeHist, crop_patch=crop_patch, sample=True, generation=generation)
+                             augment_flip=False, convert_image_to=convert_image_to, condition=1, equalizeHist=equalizeHist, crop_patch=False, sample=True, generation=generation)
                 trian_folder = folder[0:2]
 
                 self.sample_dataset = ds
