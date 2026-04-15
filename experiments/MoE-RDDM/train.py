@@ -52,7 +52,7 @@ else:
 # ==========================================
 # 🎯 提取训练超参数到外层，方便两阶段缩放
 # ==========================================
-gradient_accumulate_every = 8  # 提取到这里统一管理
+gradient_accumulate_every = 4  # 提取到这里统一管理
 
 if condition:
     base_path = "./data/DIV2K_x4_min"
@@ -62,7 +62,7 @@ if condition:
         f"{base_path}/test_gt.flist",
         f"{base_path}/test_input.flist"
     ]
-    train_batch_size = 1
+    train_batch_size = 2
     num_samples = 1
     sum_scale = 0.01
     image_size = 256
