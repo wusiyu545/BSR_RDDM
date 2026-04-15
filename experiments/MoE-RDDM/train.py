@@ -56,7 +56,7 @@ else:
 gradient_accumulate_every = 8  # 提取到这里统一管理
 
 if condition:
-    base_path = "./data/FFHQ_512"
+    base_path = "./data/DIV2K_x4_min"
     folder = [
         f"{base_path}/train_gt.flist",
         f"{base_path}/train_gt.flist",
@@ -66,7 +66,7 @@ if condition:
     train_batch_size = 1
     num_samples = 4
     sum_scale = 0.01
-    image_size = 512
+    image_size = 256
 else:
     folder = '/home/liu/disk12t/liu_data/dataset/CelebA/img_align_celeba'
     train_batch_size = 32

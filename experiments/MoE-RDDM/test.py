@@ -54,7 +54,7 @@ if condition:
     train_batch_size = 1   # 这里只是 Trainer 初始化占位
     num_samples = 1        # 测试逐张输出，最省显存
     sum_scale = 0.01
-    image_size = 512
+    image_size = 256
 else:
     folder = '/home/liu/disk12t/liu_data/dataset/CelebA/img_align_celeba'
     train_batch_size = 32
