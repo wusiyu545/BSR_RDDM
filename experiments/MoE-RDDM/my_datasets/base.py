@@ -98,23 +98,48 @@ def build_expert_target_sr_x4(deg_info):
     """
     4 专家 soft target
     E0: compression / ringing
-    E1: gaussian / anisotropic blur
-    E2: motion blur
-    E3: downsample + noise + detail regeneration
+    E1: isotropic / mild blur
+    E2: directional / strong blur
+    E3: downsample-driven detail recovery + stronger noise
     """
     t = np.zeros(4, dtype=np.float32)
 
-    t[0] += 1.2 * deg_info.get("jpeg_strength", 0.0)
-
+    jpeg_strength = deg_info.get("jpeg_strength", 0.0)
     blur_type = deg_info.get("blur_type", "none")
     blur_strength = deg_info.get("blur_strength", 0.0)
-    if blur_type in ["iso", "aniso"]:
-        t[1] += 1.0 * blur_strength
-    elif blur_type == "motion":
-        t[2] += 1.0 * blur_strength
+    resize_strength = deg_info.get("resize_strength", 0.0)
+    noise_strength = deg_info.get("noise_strength", 0.0)
 
-    t[3] += 0.9 * deg_info.get("resize_strength", 0.0)
-    t[3] += 0.6 * deg_info.get("noise_strength", 0.0)
+    # E0: compression / ringing
+    t[0] += 1.2 * jpeg_strength
+
+    # E1 / E2: blur split
+    if blur_type == "iso":
+        # isotropic blur -> mainly E1
+        t[1] += 1.0 * blur_strength
+
+    elif blur_type == "aniso":
+        # weak anisotropic -> E1
+        # strong anisotropic -> E2
+        if blur_strength < 0.55:
+            t[1] += 0.9 * blur_strength
+            t[2] += 0.2 * blur_strength
+        else:
+            t[1] += 0.3 * blur_strength
+            t[2] += 1.0 * blur_strength
+
+    elif blur_type == "motion":
+        # motion blur -> mainly E2
+        t[2] += 1.1 * blur_strength
+
+    # E3: downsample + stronger noise + detail regeneration
+    # 不要让 resize 一票压死所有样本
+    t[3] += 0.55 * resize_strength
+    t[3] += 0.75 * noise_strength
+
+    # 如果压缩很弱且 blur 很弱，但有下采样，E3 保底承担细节补偿
+    if resize_strength > 0 and blur_strength < 0.25 and jpeg_strength < 0.2:
+        t[3] += 0.15
 
     t += 0.05
     t /= t.sum()

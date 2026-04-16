@@ -7,7 +7,7 @@ ROOT = Path(r"./data/DIV2K_x4_min")
 
 TRAIN_DIR = ROOT / "train_HR_sub"
 VAL_GT_DIR = ROOT / "val_HR"
-VAL_INPUT_DIR = ROOT / "val_LQ_x4"
+VAL_INPUT_DIR = ROOT / "val_LQ_x4_blind"
 
 TRAIN_FLIST = ROOT / "train_gt.flist"
 TEST_GT_FLIST = ROOT / "test_gt.flist"

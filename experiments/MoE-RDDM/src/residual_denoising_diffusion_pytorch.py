@@ -1153,6 +1153,12 @@ class ResidualDiffusion(nn.Module):
             else:
                 img_list = [img]
             return unnormalize_to_zero_to_one(img_list)
+    
+
+
+
+
+
 
 
     @torch.no_grad()
@@ -1184,6 +1190,9 @@ class ResidualDiffusion(nn.Module):
             x_start+extract(self.alphas_cumsum, t, x_start.shape) * x_res +
             extract(self.betas_cumsum, t, x_start.shape) * noise
         )
+
+
+
 
     @property
     def loss_fn(self):
@@ -1500,7 +1509,14 @@ class Trainer(object):
                 trian_folder = folder[0:2]
 
                 self.sample_dataset = ds
-                self.sample_loader = cycle(self.accelerator.prepare(DataLoader(self.sample_dataset, batch_size=num_samples, shuffle=True,
+                self.val_loader = DataLoader(
+                    self.sample_dataset,
+                    batch_size=1,
+                    shuffle=False,
+                    pin_memory=True,
+                    num_workers=0
+                )
+                self.sample_loader = cycle(self.accelerator.prepare(DataLoader(self.sample_dataset, batch_size=num_samples, shuffle=False,
                                                                                pin_memory=True, num_workers=0)))  # cpu_count()
 
                 ds = dataset(trian_folder, self.image_size, augment_flip=augment_flip,
@@ -1723,7 +1739,7 @@ class Trainer(object):
                     if self.step != 0 and self.step % self.save_and_sample_every == 0:
                         milestone = self.step // self.save_and_sample_every
                         self.sample(milestone)
-
+                        self.validate_fixed(max_val_images=20)
                         self.save(milestone)
 
 
@@ -1743,6 +1759,41 @@ class Trainer(object):
                 pbar.update(1)
 
         accelerator.print('training complete')
+
+    @torch.no_grad()
+    def validate_fixed(self, max_val_images=20):
+        self.ema.ema_model.eval()
+
+        psnr_list = []
+
+        for i, items in enumerate(self.val_loader):
+            if i >= max_val_images:
+                break
+
+            if self.condition_type == 2:
+                batch = [item.to(self.device) for item in items]
+                gt = batch[0]
+                x_input_sample = batch[1:]
+            elif self.condition_type == 3:
+                batch = [item.to(self.device) for item in items]
+                gt = batch[0]
+                x_input_sample = batch[1:]
+            else:
+                continue
+
+            outputs = list(self.ema.ema_model.sample(
+                x_input_sample, batch_size=1, last=True
+            ))
+            pred = outputs[-1]
+
+            mse = F.mse_loss(pred, gt)
+            psnr = -10 * torch.log10(mse + 1e-8) if mse > 0 else torch.tensor(100.0, device=gt.device)
+            psnr_list.append(psnr.item())
+
+        if len(psnr_list) > 0:
+            mean_psnr = sum(psnr_list) / len(psnr_list)
+            self.writer.add_scalar('Metrics_Validation/PSNR_fixed', mean_psnr, self.step)
+            print(f"[Validation] step={self.step} mean PSNR over {len(psnr_list)} images: {mean_psnr:.4f}")
 
     def sample(self, milestone, last=True, FID=False):
         self.ema.ema_model.eval()
@@ -1777,27 +1828,41 @@ class Trainer(object):
             else:
                 corrupted_input = final_output
             
-            # =======================================================
-            # 🚀 新增：计算并记录 Validation Metrics
-            # =======================================================
-            # 提取 Ground Truth (GT) 高清原图，要求 condition_type >= 1 才有
-            if self.condition_type > 0:
-                gt_img = show_x_input_sample[0]  # GT 位于列表首位 [0, 1]
+        # =======================================================
+        # Validation metrics + visualization
+        # =======================================================
+        if self.condition_type > 0:
+            gt_img = show_x_input_sample[0]
+        else:
+            gt_img = None
 
-                # 1. 计算 PSNR
-                mse = F.mse_loss(final_output, gt_img)
-                # 保护机制防止 log(0)
-                psnr = -10 * torch.log10(mse + 1e-8) if mse > 0 else torch.tensor(100.0)
-                self.writer.add_scalar('Metrics_Validation/PSNR', psnr.item(), self.step)
+        if self.condition_type in [2, 3]:
+            corrupted_input = show_x_input_sample[1]
+        elif len(show_x_input_sample) > 0:
+            corrupted_input = show_x_input_sample[-1]
+        else:
+            corrupted_input = final_output
 
+        # 1) 记录“当前 sample 批次”的 PSNR
+        if gt_img is not None:
+            mse = F.mse_loss(final_output, gt_img)
+            psnr = -10 * torch.log10(mse + 1e-8) if mse > 0 else torch.tensor(100.0, device=gt_img.device)
 
+            # 建议把这个名字改掉，避免和固定验证集 PSNR 混淆
+            self.writer.add_scalar('Metrics_Validation/PSNR_sample', psnr.item(), self.step)
 
-            # 计算放大 10 倍的残差
-            residual = torch.abs(final_output - corrupted_input) * 10
-            residual = torch.clamp(residual, 0, 1)
+        # 2) 恢复误差图：Output vs GT
+        if gt_img is not None:
+            error_map = torch.abs(final_output - gt_img) * 10
+            error_map = torch.clamp(error_map, 0, 1)
 
-            # 拼接显示：[真值, 输入, 输出, 残差]
-            all_images_list = show_x_input_sample + [final_output, residual]
+            # 拼图顺序：GT / Input / Output / ErrorMap
+            all_images_list = [gt_img, corrupted_input, final_output, error_map]
+        else:
+            # 无 GT 时退回到输入差异图
+            diff_map = torch.abs(final_output - corrupted_input) * 10
+            diff_map = torch.clamp(diff_map, 0, 1)
+            all_images_list = [corrupted_input, final_output, diff_map]
             all_images = torch.cat(all_images_list, dim=0)
 
             # 自动调整 nrow，让每一组对比都在一行显示
