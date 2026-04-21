@@ -2,7 +2,6 @@ import os
 import random
 from pathlib import Path
 
-import Augmentor
 import cv2
 import numpy as np
 import torch
@@ -17,133 +16,40 @@ def convert_image_to_fn(img_type, image):
     return image
 
 
-def _apply_jpeg(img_uint8, quality):
-    encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)]
-    success, encimg = cv2.imencode(".jpg", img_uint8, encode_param)
-    if not success:
-        return img_uint8
-    decimg = cv2.imdecode(encimg, 1)
-    return decimg
-
-
-def _random_motion_kernel(kernel_size=15):
-    kernel = np.zeros((kernel_size, kernel_size), dtype=np.float32)
-    xs, ys = np.meshgrid(np.arange(kernel_size), np.arange(kernel_size))
-    center = (kernel_size - 1) / 2.0
-
-    angle = random.uniform(0, np.pi)
-    cos_a, sin_a = np.cos(angle), np.sin(angle)
-
-    x = xs - center
-    y = ys - center
-    dist = np.abs(-sin_a * x + cos_a * y)
-
-    kernel[dist < 0.5] = 1.0
-    s = kernel.sum()
-    if s > 0:
-        kernel /= s
-    else:
-        kernel[kernel_size // 2, kernel_size // 2] = 1.0
-    return kernel
-
-
-def _random_gaussian_kernel():
+def _random_iso_gaussian_kernel(kernel_size=21, sig_min=0.2, sig_max=4.0):
     """
-    返回:
-        kernel: 卷积核
-        blur_type: 'iso' / 'aniso'
-        blur_strength: 0~1 粗略强度
+    对齐 MCDFormer 的 iso_gaussian 模式：
+    kernel_size = 21
+    sigma ~ U(0.2, 4.0)
     """
-    ksize = random.choice([7, 9, 11, 13, 15, 17, 19, 21])
-
-    if random.random() < 0.5:
-        sigma = random.uniform(0.2, 3.0)
-        k1d = cv2.getGaussianKernel(ksize, sigma)
-        kernel = np.outer(k1d, k1d).astype(np.float32)
-        blur_strength = min(sigma / 3.0, 1.0)
-        return kernel, "iso", blur_strength
-
-    sigma_x = random.uniform(0.5, 4.0)
-    sigma_y = random.uniform(0.5, 4.0)
-    theta = random.uniform(0, np.pi)
-
-    ax = np.arange(-(ksize // 2), ksize // 2 + 1)
-    xx, yy = np.meshgrid(ax, ax)
-
-    xr = xx * np.cos(theta) + yy * np.sin(theta)
-    yr = -xx * np.sin(theta) + yy * np.cos(theta)
-
-    kernel = np.exp(-0.5 * ((xr ** 2) / (sigma_x ** 2) + (yr ** 2) / (sigma_y ** 2)))
-    kernel = kernel.astype(np.float32)
-    kernel /= np.sum(kernel)
-
-    blur_strength = min(max(sigma_x, sigma_y) / 4.0, 1.0)
-    return kernel, "aniso", blur_strength
+    sigma = random.uniform(sig_min, sig_max)
+    k1d = cv2.getGaussianKernel(kernel_size, sigma)
+    kernel = np.outer(k1d, k1d).astype(np.float32)
+    kernel /= max(kernel.sum(), 1e-12)
+    return kernel, sigma
 
 
-def _sample_blur_kernel():
+def build_expert_target_sr_x4(sigma):
     """
-    统一 blur 采样入口，便于 first-order / second-order 复用
+    按 blur sigma 强度给 4 个专家做 soft target
+    对齐 MCDFormer 后，不再按 JPEG / noise / motion blur 分专家，
+    而是按模糊强度分桶。
+
+    E0: very mild blur
+    E1: mild-medium blur
+    E2: medium-strong blur
+    E3: strong blur
     """
-    if random.random() < 0.75:
-        return _random_gaussian_kernel()
+    sigma = float(np.clip(sigma, 0.2, 4.0))
 
-    kernel = _random_motion_kernel(kernel_size=random.choice([9, 11, 13, 15]))
-    blur_type = "motion"
-    blur_strength = 0.8
-    return kernel, blur_type, blur_strength
+    centers = np.array([0.6, 1.4, 2.4, 3.5], dtype=np.float32)
+    widths = np.array([0.45, 0.50, 0.60, 0.65], dtype=np.float32)
 
+    weights = np.exp(-0.5 * ((sigma - centers) / widths) ** 2).astype(np.float32)
+    weights += 1e-3
+    weights /= weights.sum()
 
-def build_expert_target_sr_x4(deg_info):
-    """
-    4 专家 soft target
-    E0: compression / ringing
-    E1: isotropic / mild blur
-    E2: directional / strong blur
-    E3: downsample-driven detail recovery + stronger noise
-    """
-    t = np.zeros(4, dtype=np.float32)
-
-    jpeg_strength = deg_info.get("jpeg_strength", 0.0)
-    blur_type = deg_info.get("blur_type", "none")
-    blur_strength = deg_info.get("blur_strength", 0.0)
-    resize_strength = deg_info.get("resize_strength", 0.0)
-    noise_strength = deg_info.get("noise_strength", 0.0)
-
-    # E0: compression / ringing
-    t[0] += 1.2 * jpeg_strength
-
-    # E1 / E2: blur split
-    if blur_type == "iso":
-        # isotropic blur -> mainly E1
-        t[1] += 1.0 * blur_strength
-
-    elif blur_type == "aniso":
-        # weak anisotropic -> E1
-        # strong anisotropic -> E2
-        if blur_strength < 0.55:
-            t[1] += 0.9 * blur_strength
-            t[2] += 0.2 * blur_strength
-        else:
-            t[1] += 0.3 * blur_strength
-            t[2] += 1.0 * blur_strength
-
-    elif blur_type == "motion":
-        # motion blur -> mainly E2
-        t[2] += 1.1 * blur_strength
-
-    # E3: downsample + stronger noise + detail regeneration
-    # 不要让 resize 一票压死所有样本
-    t[3] += 0.20 * resize_strength
-    t[3] += 0.45 * noise_strength
-
-    # 如果压缩很弱且 blur 很弱，但有下采样，E3 保底承担细节补偿
-    if resize_strength > 0 and blur_strength < 0.25 and jpeg_strength < 0.2:
-        t[3] += 0.05
-
-    t += 0.03
-    t /= t.sum()
-    return t.astype(np.float32)
+    return weights.astype(np.float32)
 
 
 class Dataset(TorchDataset):
@@ -161,9 +67,11 @@ class Dataset(TorchDataset):
     ):
         super().__init__()
 
-        # blind SR x4 配置
+        # 对齐 MCDFormer 的 x4 blind SR 设定
         self.sr_scale = 4
-        self.two_order_deg = True
+        self.blur_kernel_size = 21
+        self.sig_min = 0.2
+        self.sig_max = 4.0
 
         self.equalizeHist = equalizeHist
         self.exts = tuple([e.lower() for e in exts])
@@ -200,96 +108,43 @@ class Dataset(TorchDataset):
 
     def degrade_for_blind_sr_x4(self, img_gt):
         """
-        img_gt: HWC, uint8, BGR, 范围 0~255
+        对齐 MCDFormer 的训练退化协议：
+        1) iso gaussian blur, kernel_size=21, sigma in [0.2, 4.0]
+        2) bicubic downsample x4
+        3) quantize to uint8
+        4) bicubic upsample back to GT size (为了兼容当前 RDDM 输入同尺寸条件)
+
+        img_gt:
+            HWC, uint8, BGR, 0~255
+
         return:
-            img_lq_up: 与 GT 同尺寸的退化输入
-            expert_target: 4 维 soft label
+            img_lq_up: HWC, uint8, BGR, same size as GT
+            expert_target: 4-dim soft label
         """
         img = img_gt.astype(np.float32)
         h, w = img.shape[:2]
 
-        deg_info = {
-            "blur_type": "none",
-            "blur_strength": 0.0,
-            "resize_strength": 0.0,
-            "noise_strength": 0.0,
-            "jpeg_strength": 0.0,
-        }
+        # 1) iso Gaussian blur
+        kernel, sigma = _random_iso_gaussian_kernel(
+            kernel_size=self.blur_kernel_size,
+            sig_min=self.sig_min,
+            sig_max=self.sig_max,
+        )
+        img = cv2.filter2D(img, -1, kernel)
 
-        # 1) first-order blur
-        if random.random() < 0.9:
-            kernel, blur_type, blur_strength = _sample_blur_kernel()
-            img = cv2.filter2D(img, -1, kernel)
-            deg_info["blur_type"] = blur_type
-            deg_info["blur_strength"] = blur_strength
-
-        # 2) mild pre-resize perturbation
-        # 为了更贴近 x4 blind SR，范围收紧一点
-        if random.random() < 0.5:
-            resize_factor = random.uniform(0.95, 1.05)
-            inter_mode = random.choice([cv2.INTER_LINEAR, cv2.INTER_CUBIC, cv2.INTER_AREA])
-            tmp_w = max(1, int(round(w * resize_factor)))
-            tmp_h = max(1, int(round(h * resize_factor)))
-            img = cv2.resize(img, (tmp_w, tmp_h), interpolation=inter_mode)
-
-        # 3) force native x4 LR
+        # 2) bicubic x4 downsample
         lr_w = max(1, w // self.sr_scale)
         lr_h = max(1, h // self.sr_scale)
-        inter_mode = random.choice([cv2.INTER_LINEAR, cv2.INTER_CUBIC, cv2.INTER_AREA])
-        img = cv2.resize(img, (lr_w, lr_h), interpolation=inter_mode)
-        deg_info["resize_strength"] = 1.0
+        img_lr = cv2.resize(img, (lr_w, lr_h), interpolation=cv2.INTER_CUBIC)
 
-        # 4) noise on LR
-        if random.random() < 0.8:
-            noise_level = random.uniform(1.0, 12.0)
-            noise = np.random.normal(0, noise_level, img.shape).astype(np.float32)
-            img = img + noise
-            deg_info["noise_strength"] = (noise_level - 1.0) / 11.0
+        # 3) quantize
+        img_lr = np.clip(np.round(img_lr), 0, 255).astype(np.uint8)
 
-        # 5) JPEG on LR
-        img = np.clip(img, 0, 255).astype(np.uint8)
-        if random.random() < 0.8:
-            q = random.randint(30, 95)
-            img = _apply_jpeg(img, q)
-            deg_info["jpeg_strength"] = (95.0 - q) / 65.0
-
-        # 6) optional second-order light degradation
-        if self.two_order_deg and random.random() < 0.5:
-            # second blur
-            if random.random() < 0.5:
-                kernel2, blur_type2, blur_strength2 = _sample_blur_kernel()
-                img = cv2.filter2D(img, -1, kernel2)
-
-                # 用“更强”的 blur 更新标签，避免第二次 blur 完全丢失在 expert_target 里
-                if blur_strength2 >= deg_info["blur_strength"]:
-                    deg_info["blur_type"] = blur_type2
-                    deg_info["blur_strength"] = blur_strength2
-
-            # second noise
-            if random.random() < 0.5:
-                noise_level2 = random.uniform(0.5, 5.0)
-                noise2 = np.random.normal(0, noise_level2, img.shape).astype(np.float32)
-                img = np.clip(img.astype(np.float32) + noise2, 0, 255).astype(np.uint8)
-                deg_info["noise_strength"] = max(
-                    deg_info["noise_strength"],
-                    min((noise_level2 - 0.5) / 4.5, 1.0),
-                )
-
-            # second JPEG
-            if random.random() < 0.5:
-                q2 = random.randint(50, 95)
-                img = _apply_jpeg(img, q2)
-                deg_info["jpeg_strength"] = max(
-                    deg_info["jpeg_strength"],
-                    (95.0 - q2) / 45.0,
-                )
-
-        # 7) upsample back to GT size
-        up_mode = random.choice([cv2.INTER_LINEAR, cv2.INTER_CUBIC, cv2.INTER_LANCZOS4])
-        img_lq_up = cv2.resize(img, (w, h), interpolation=up_mode)
+        # 4) upsample back to GT size (for current RDDM condition input)
+        img_lq_up = cv2.resize(img_lr, (w, h), interpolation=cv2.INTER_CUBIC)
         img_lq_up = np.ascontiguousarray(img_lq_up)
 
-        expert_target = build_expert_target_sr_x4(deg_info)
+        expert_target = build_expert_target_sr_x4(sigma)
         return img_lq_up, expert_target
 
     def __getitem__(self, index):
@@ -297,44 +152,51 @@ class Dataset(TorchDataset):
             img0_pil = Image.open(self.gt[index])
             img0_pil = convert_image_to_fn(self.convert_image_to, img0_pil) if self.convert_image_to else img0_pil
 
+            # ========== sample / inference 模式 ==========
             if self.sample:
                 img1_pil = Image.open(self.input[index])
                 img1_pil = convert_image_to_fn(self.convert_image_to, img1_pil) if self.convert_image_to else img1_pil
-                expert_target = None
-            else:
-                img_gt = cv2.cvtColor(np.array(img0_pil), cv2.COLOR_RGB2BGR)
-                img_lq, expert_target = self.degrade_for_blind_sr_x4(img_gt)
-                img1_pil = Image.fromarray(cv2.cvtColor(img_lq.astype(np.uint8), cv2.COLOR_BGR2RGB))
 
-            img0, img1 = self.pad_img([img0_pil, img1_pil], self.image_size)
+                img0, img1 = self.pad_img([img0_pil, img1_pil], self.image_size)
 
-            if self.crop_patch and not self.sample:
-                img0, img1 = self.get_patch([img0, img1], self.image_size)
+                if self.crop_patch:
+                    img0, img1 = self.get_patch([img0, img1], self.image_size)
+                else:
+                    img0 = self.maybe_resize_to_square(img0, self.image_size)
+                    img1 = self.maybe_resize_to_square(img1, self.image_size)
 
-            img1 = self.cv2equalizeHist(img1) if self.equalizeHist else img1
+                if self.equalizeHist:
+                    img1 = self.cv2equalizeHist(img1)
 
-            images = [[img0, img1]]
-            p = Augmentor.DataPipeline(images)
+                img0 = cv2.cvtColor(img0, cv2.COLOR_BGR2RGB)
+                img1 = cv2.cvtColor(img1, cv2.COLOR_BGR2RGB)
+
+                return [self.to_tensor(img0), self.to_tensor(img1)]
+
+            # ========== train 模式：先 HR 增强/crop，再退化 ==========
+            img0 = self.pad_img([img0_pil], self.image_size)[0]
+
+            # 对齐 MCDFormer：先 augment 再 crop
             if self.augment_flip:
-                p.flip_left_right(1)
+                img0 = self.augment_img(img0)
 
-            if not self.crop_patch:
-                h, w = img0.shape[:2]
-                if h != self.image_size or w != self.image_size:
-                    p.resize(1, self.image_size, self.image_size)
+            if self.crop_patch:
+                img0 = self.get_patch([img0], self.image_size)[0]
+            else:
+                img0 = self.maybe_resize_to_square(img0, self.image_size)
 
-            g = p.generator(batch_size=1)
-            augmented_images = next(g)
+            # 在 HR patch 上做退化
+            img1, expert_target = self.degrade_for_blind_sr_x4(img0)
 
-            img0_out = cv2.cvtColor(augmented_images[0][0], cv2.COLOR_BGR2RGB)
-            img1_out = cv2.cvtColor(augmented_images[0][1], cv2.COLOR_BGR2RGB)
+            if self.equalizeHist:
+                img1 = self.cv2equalizeHist(img1)
 
-            if self.sample:
-                return [self.to_tensor(img0_out), self.to_tensor(img1_out)]
+            img0 = cv2.cvtColor(img0, cv2.COLOR_BGR2RGB)
+            img1 = cv2.cvtColor(img1, cv2.COLOR_BGR2RGB)
 
             return [
-                self.to_tensor(img0_out),
-                self.to_tensor(img1_out),
+                self.to_tensor(img0),
+                self.to_tensor(img1),
                 torch.tensor(expert_target, dtype=torch.float32),
             ]
 
@@ -345,25 +207,18 @@ class Dataset(TorchDataset):
 
             img = self.pad_img([img], self.image_size)[0]
 
+            if self.augment_flip and not self.sample:
+                img = self.augment_img(img)
+
             if self.crop_patch and not self.sample:
                 img = self.get_patch([img], self.image_size)[0]
+            else:
+                img = self.maybe_resize_to_square(img, self.image_size)
 
-            img = self.cv2equalizeHist(img) if self.equalizeHist else img
+            if self.equalizeHist:
+                img = self.cv2equalizeHist(img)
 
-            images = [[img]]
-            p = Augmentor.DataPipeline(images)
-            if self.augment_flip:
-                p.flip_left_right(1)
-
-            if not self.crop_patch:
-                h, w = img.shape[:2]
-                if h != self.image_size or w != self.image_size:
-                    p.resize(1, self.image_size, self.image_size)
-
-            g = p.generator(batch_size=1)
-            augmented_images = next(g)
-            img = cv2.cvtColor(augmented_images[0][0], cv2.COLOR_BGR2RGB)
-
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             return self.to_tensor(img)
 
         elif self.condition == 2:
@@ -377,27 +232,22 @@ class Dataset(TorchDataset):
 
             img0, img1, img2 = self.pad_img([img0, img1, img2], self.image_size)
 
+            if self.augment_flip and not self.sample:
+                img0, img1, img2 = self.augment_imgs([img0, img1, img2])
+
             if self.crop_patch and not self.sample:
                 img0, img1, img2 = self.get_patch([img0, img1, img2], self.image_size)
+            else:
+                img0 = self.maybe_resize_to_square(img0, self.image_size)
+                img1 = self.maybe_resize_to_square(img1, self.image_size)
+                img2 = self.maybe_resize_to_square(img2, self.image_size)
 
-            img1 = self.cv2equalizeHist(img1) if self.equalizeHist else img1
+            if self.equalizeHist:
+                img1 = self.cv2equalizeHist(img1)
 
-            images = [[img0, img1, img2]]
-            p = Augmentor.DataPipeline(images)
-            if self.augment_flip:
-                p.flip_left_right(1)
-
-            if not self.crop_patch:
-                h, w = img0.shape[:2]
-                if h != self.image_size or w != self.image_size:
-                    p.resize(1, self.image_size, self.image_size)
-
-            g = p.generator(batch_size=1)
-            augmented_images = next(g)
-
-            img0 = cv2.cvtColor(augmented_images[0][0], cv2.COLOR_BGR2RGB)
-            img1 = cv2.cvtColor(augmented_images[0][1], cv2.COLOR_BGR2RGB)
-            img2 = cv2.cvtColor(augmented_images[0][2], cv2.COLOR_BGR2RGB)
+            img0 = cv2.cvtColor(img0, cv2.COLOR_BGR2RGB)
+            img1 = cv2.cvtColor(img1, cv2.COLOR_BGR2RGB)
+            img2 = cv2.cvtColor(img2, cv2.COLOR_BGR2RGB)
 
             return [self.to_tensor(img0), self.to_tensor(img1), self.to_tensor(img2)]
 
@@ -449,6 +299,36 @@ class Dataset(TorchDataset):
                 sub_dir = (path.split("/"))[-1]
                 return sub_dir + "_" + os.path.basename(name)
 
+    def augment_img(self, img):
+        """
+        对齐 MCDFormer 的增强风格：
+        hflip / vflip / rot90
+        输入输出均为 HWC, BGR
+        """
+        if random.random() < 0.5:
+            img = img[:, ::-1, :]
+        if random.random() < 0.5:
+            img = img[::-1, :, :]
+        if random.random() < 0.5:
+            img = img.transpose(1, 0, 2)
+        return np.ascontiguousarray(img)
+
+    def augment_imgs(self, image_list):
+        hflip = random.random() < 0.5
+        vflip = random.random() < 0.5
+        rot90 = random.random() < 0.5
+
+        out = []
+        for img in image_list:
+            if hflip:
+                img = img[:, ::-1, :]
+            if vflip:
+                img = img[::-1, :, :]
+            if rot90:
+                img = img.transpose(1, 0, 2)
+            out.append(np.ascontiguousarray(img))
+        return out
+
     def get_patch(self, image_list, patch_size):
         h, w = image_list[0].shape[:2]
         rr = random.randint(0, h - patch_size)
@@ -458,6 +338,12 @@ class Dataset(TorchDataset):
         for img in image_list:
             out.append(img[rr:rr + patch_size, cc:cc + patch_size, :])
         return out
+
+    def maybe_resize_to_square(self, img, target_size):
+        h, w = img.shape[:2]
+        if h != target_size or w != target_size:
+            img = cv2.resize(img, (target_size, target_size), interpolation=cv2.INTER_CUBIC)
+        return img
 
     def pad_img(self, img_list, patch_size, block_size=8):
         out = []

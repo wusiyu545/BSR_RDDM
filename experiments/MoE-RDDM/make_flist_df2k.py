@@ -3,15 +3,12 @@ from pathlib import Path
 # =========================
 # 路径配置
 # =========================
-ROOT = Path(r"./data/DIV2K_x4_min")
+ROOT = Path(r"./data/DF2K_HR")
 
-TRAIN_DIR = ROOT / "train_HR_sub"
-VAL_GT_DIR = ROOT / "val_HR"
-VAL_INPUT_DIR = ROOT / "val_LQ_x4_blind"
+DIV2K_DIR = ROOT / "DIV2K_HR"
+FLICKR2K_DIR = ROOT / "Flickr2K_HR"
 
-TRAIN_FLIST = ROOT / "train_gt.flist"
-TEST_GT_FLIST = ROOT / "test_gt.flist"
-TEST_INPUT_FLIST = ROOT / "test_input.flist"
+TRAIN_FLIST = ROOT / "train_hr.flist"
 
 IMG_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
 
@@ -32,6 +29,7 @@ def collect_images(folder: Path):
 
 
 def write_flist(paths, out_file: Path):
+    out_file.parent.mkdir(parents=True, exist_ok=True)
     with open(out_file, "w", encoding="utf-8") as f:
         for p in paths:
             # 统一写成正斜杠，避免 Windows 路径转义问题
@@ -39,18 +37,19 @@ def write_flist(paths, out_file: Path):
 
 
 def main():
-    train_imgs = collect_images(TRAIN_DIR)
-    val_gt_imgs = collect_images(VAL_GT_DIR)
-    val_input_imgs = collect_images(VAL_INPUT_DIR)
+    div2k_imgs = collect_images(DIV2K_DIR)
+    flickr2k_imgs = collect_images(FLICKR2K_DIR)
+
+    train_imgs = div2k_imgs + flickr2k_imgs
+    train_imgs = sorted(train_imgs, key=lambda x: str(x).lower())
 
     write_flist(train_imgs, TRAIN_FLIST)
-    write_flist(val_gt_imgs, TEST_GT_FLIST)
-    write_flist(val_input_imgs, TEST_INPUT_FLIST)
 
-    print("flist 生成完成：")
-    print(f"  {TRAIN_FLIST.name}: {len(train_imgs)}")
-    print(f"  {TEST_GT_FLIST.name}: {len(val_gt_imgs)}")
-    print(f"  {TEST_INPUT_FLIST.name}: {len(val_input_imgs)}")
+    print("DF2K train_hr.flist 生成完成：")
+    print(f"  DIV2K_HR    : {len(div2k_imgs)}")
+    print(f"  Flickr2K_HR : {len(flickr2k_imgs)}")
+    print(f"  Total       : {len(train_imgs)}")
+    print(f"  Output      : {TRAIN_FLIST}")
 
 
 if __name__ == "__main__":
