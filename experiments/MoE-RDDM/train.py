@@ -82,20 +82,14 @@ gradient_accumulate_every = 4
 #    这样不会一下子把测试链路改掉。
 # =========================================================
 if condition:
-    # -------- 训练集：改成 DF2K HR --------
-    train_base_path = "./data/DF2K_HR"
-    train_hr_flist = f"{train_base_path}/train_hr.flist"
-
-    # -------- 测试集：先沿用你现有 paired flist --------
-    eval_base_path = "./data/DIV2K_x4_min"
-    test_gt_flist = f"{eval_base_path}/test_gt.flist"
-    test_input_flist = f"{eval_base_path}/test_input.flist"
+    train_hr_flist = "./data/DF2K/train_hr.flist"
+    val_hr_flist = "./data/benchmark_flist/DF2KVal_hr.flist"
 
     folder = [
-        train_hr_flist,      # folder[0] -> GT train
-        train_hr_flist,      # folder[1] -> 占位，同长度；训练时 base.py 在线生成 LQ
-        test_gt_flist,       # folder[2] -> test GT
-        test_input_flist     # folder[3] -> test input
+        train_hr_flist,  # train GT
+        train_hr_flist,  # 占位：训练在线退化
+        val_hr_flist,  # val GT
+        val_hr_flist  # 占位：验证在线退化
     ]
 
     train_batch_size = 2

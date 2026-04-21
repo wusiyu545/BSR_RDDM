@@ -16,6 +16,31 @@ def convert_image_to_fn(img_type, image):
     return image
 
 
+def degrade_for_eval_bicubic_x4(self, img_gt):
+    """
+    验证 / 测试对齐 MCDFormer 的 bicubic x4 benchmark:
+    - 不加 blur
+    - 不加 noise
+    - 不加 JPEG
+    - 只做 bicubic x4 下采样
+    - 再 bicubic 上采样回 GT 尺寸（为了兼容当前 RDDM 输入）
+    """
+    img = img_gt.astype(np.float32)
+    h, w = img.shape[:2]
+
+    lr_w = max(1, w // self.sr_scale)
+    lr_h = max(1, h // self.sr_scale)
+
+    img_lr = cv2.resize(img, (lr_w, lr_h), interpolation=cv2.INTER_CUBIC)
+    img_lr = np.clip(np.round(img_lr), 0, 255).astype(np.uint8)
+
+    img_lq_up = cv2.resize(img_lr, (w, h), interpolation=cv2.INTER_CUBIC)
+    img_lq_up = np.ascontiguousarray(img_lq_up)
+
+    return img_lq_up
+
+
+
 def _random_iso_gaussian_kernel(kernel_size=21, sig_min=0.2, sig_max=4.0):
     """
     对齐 MCDFormer 的 iso_gaussian 模式：
@@ -154,16 +179,15 @@ class Dataset(TorchDataset):
 
             # ========== sample / inference 模式 ==========
             if self.sample:
-                img1_pil = Image.open(self.input[index])
-                img1_pil = convert_image_to_fn(self.convert_image_to, img1_pil) if self.convert_image_to else img1_pil
+                # 只从 GT/HR 读图，不再依赖外部 input 图
+                img0 = self.pad_img([img0_pil], self.image_size)[0]
 
-                img0, img1 = self.pad_img([img0_pil, img1_pil], self.image_size)
-
+                # 验证 / 测试时不要随机 crop
                 if self.crop_patch:
-                    img0, img1 = self.get_patch([img0, img1], self.image_size)
-                else:
-                    img0 = self.maybe_resize_to_square(img0, self.image_size)
-                    img1 = self.maybe_resize_to_square(img1, self.image_size)
+                    img0 = self.get_patch([img0], self.image_size)[0]
+
+                # 在线生成 bicubic x4 输入
+                img1 = self.degrade_for_eval_bicubic_x4(img0)
 
                 if self.equalizeHist:
                     img1 = self.cv2equalizeHist(img1)
@@ -371,7 +395,8 @@ class Dataset(TorchDataset):
         return out
 
     def get_pad_size(self, index, block_size=8):
-        img = Image.open(self.input[index])
+        path = self.gt[index] if hasattr(self, "gt") else self.input[index]
+        img = Image.open(path)
         patch_size = self.image_size
         img = cv2.cvtColor(np.asarray(img), cv2.COLOR_RGB2BGR)
         h, w = img.shape[:2]

@@ -43,13 +43,17 @@ else:
     input_condition_mask = False
 
 if condition:
-    # 与当前 train.py 完全对齐
-    base_path = "./data/FFHQ_512"
+    
+    BENCHMARK_NAME = "Set5"
+
+    train_hr_flist = "./data/DF2K/train_hr.flist"
+    test_hr_flist = f"./data/benchmark_flist/{BENCHMARK_NAME}_hr.flist"
+
     folder = [
-        f"{base_path}/train_gt.flist",
-        f"{base_path}/train_gt.flist",
-        f"{base_path}/test_gt.flist",
-        f"{base_path}/test_input.flist",
+        train_hr_flist,  # 占位
+        train_hr_flist,  # 占位
+        test_hr_flist,  # test GT
+        test_hr_flist  # 占位：测试在线退化
     ]
     train_batch_size = 1   # 这里只是 Trainer 初始化占位
     num_samples = 1        # 测试逐张输出，最省显存

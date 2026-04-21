@@ -1585,6 +1585,168 @@ class Trainer(object):
             return f"{h:02d}:{m:02d}:{s:02d}"
         else:
             return f"{m:02d}:{s:02d}"
+    def get_eval_dataset_name(self):
+        """
+        从 sample_dataset 的 GT 路径里推断当前验证/测试集名字。
+        例如:
+            .../benchmark/DF2KVal/HR/xxx.png -> DF2KVal
+            .../benchmark/Set5/HR/xxx.png    -> Set5
+        """
+        if not hasattr(self, 'sample_dataset'):
+            return "Unknown"
+
+        if not hasattr(self.sample_dataset, 'gt'):
+            return "Unknown"
+
+        if len(self.sample_dataset.gt) == 0:
+            return "Unknown"
+
+        p = str(self.sample_dataset.gt[0]).replace("\\", "/")
+        parts = p.split("/")
+
+        if "benchmark" in parts:
+            idx = parts.index("benchmark")
+            if idx + 1 < len(parts):
+                return parts[idx + 1]
+
+        return "Unknown"
+
+    def is_public_benchmark(self, dataset_name):
+        """
+        公开 benchmark 按 MCDFormer benchmark=True 逻辑走:
+            shave = scale
+        自定义验证集（例如 DF2KVal）按 benchmark=False 逻辑走:
+            shave = scale + 6
+        """
+        public_sets = {"Set5", "Set14", "BSDS100", "Urban100", "manga109", "Manga109"}
+        return dataset_name in public_sets
+
+    def quantize_255(self, img):
+        """
+        输入 img 为 [0,1] tensor
+        输出为 [0,255] tensor, round + clamp
+        对齐 MCDFormer utility.quantize(..., rgb_range=255)
+        """
+        return img.mul(255.0).clamp(0, 255).round()
+
+    def remove_pad(self, img, pad_size):
+        """
+        pad_size = [bottom, right]
+        img: [B,C,H,W]
+        """
+        bottom, right = pad_size
+        _, _, h, w = img.shape
+
+        h_end = h - bottom if bottom > 0 else h
+        w_end = w - right if right > 0 else w
+
+        return img[:, :, :h_end, :w_end]
+
+    def crop_pair_to_scale(self, sr, hr, scale):
+        """
+        对齐 MCDFormer 的 crop_border 思路：
+        保证尺寸能整除 scale
+        """
+        _, _, h, w = hr.shape
+        h = int(h // scale * scale)
+        w = int(w // scale * scale)
+
+        sr = sr[:, :, :h, :w]
+        hr = hr[:, :, :h, :w]
+        return sr, hr
+
+    def calc_psnr_mcd(self, sr_255, hr_255, scale, benchmark=False):
+        """
+        复刻 MCDFormer utility.calc_psnr 逻辑
+        输入:
+            sr_255, hr_255: [B,C,H,W], range [0,255]
+        """
+        diff = (sr_255 - hr_255).div(255.0)
+
+        if benchmark:
+            shave = scale
+            if diff.size(1) > 1:
+                convert = diff.new_zeros(1, 3, 1, 1)
+                convert[0, 0, 0, 0] = 65.738
+                convert[0, 1, 0, 0] = 129.057
+                convert[0, 2, 0, 0] = 25.064
+                diff = diff.mul(convert).div(256.0)
+                diff = diff.sum(dim=1, keepdim=True)
+        else:
+            shave = scale + 6
+
+        shave = int(math.ceil(shave))
+
+        if diff.size(-2) <= 2 * shave or diff.size(-1) <= 2 * shave:
+            valid = diff
+        else:
+            valid = diff[:, :, shave:-shave, shave:-shave]
+
+        mse = valid.pow(2).mean().item()
+        if mse <= 1e-12:
+            return 100.0
+
+        return -10 * math.log10(mse)
+
+    def calc_ssim_mcd(self, sr_255, hr_255, scale=2, benchmark=False):
+        """
+        复刻 MCDFormer utility.calc_ssim 的主逻辑：
+        - 输入为 [0,255]
+        - 转 Y 通道
+        - 再做 SSIM
+        """
+        border = int(math.ceil(scale)) if benchmark else int(math.ceil(scale) + 6)
+
+        img1 = sr_255.data.squeeze().float().clamp(0, 255).round().cpu().numpy()
+        img1 = np.transpose(img1, (1, 2, 0))
+        img2 = hr_255.data.squeeze().float().clamp(0, 255).round().cpu().numpy()
+        img2 = np.transpose(img2, (1, 2, 0))
+
+        img1_y = np.dot(img1, [65.738, 129.057, 25.064]) / 255.0 + 16.0
+        img2_y = np.dot(img2, [65.738, 129.057, 25.064]) / 255.0 + 16.0
+
+        if img1_y.shape != img2_y.shape:
+            raise ValueError("Input images must have the same dimensions.")
+
+        h, w = img1_y.shape[:2]
+        if h <= 2 * border or w <= 2 * border:
+            crop1 = img1_y
+            crop2 = img2_y
+        else:
+            crop1 = img1_y[border:h - border, border:w - border]
+            crop2 = img2_y[border:h - border, border:w - border]
+
+        return self.ssim_np(crop1, crop2)
+
+    def ssim_np(self, img1, img2):
+        """
+        与 MCDFormer utility.ssim 一致
+        输入为单通道 2D numpy array, range [0,255]
+        """
+        C1 = (0.01 * 255) ** 2
+        C2 = (0.03 * 255) ** 2
+
+        img1 = img1.astype(np.float64)
+        img2 = img2.astype(np.float64)
+
+        kernel = cv2.getGaussianKernel(11, 1.5)
+        window = np.outer(kernel, kernel.transpose())
+
+        mu1 = cv2.filter2D(img1, -1, window)[5:-5, 5:-5]
+        mu2 = cv2.filter2D(img2, -1, window)[5:-5, 5:-5]
+
+        mu1_sq = mu1 ** 2
+        mu2_sq = mu2 ** 2
+        mu1_mu2 = mu1 * mu2
+
+        sigma1_sq = cv2.filter2D(img1 ** 2, -1, window)[5:-5, 5:-5] - mu1_sq
+        sigma2_sq = cv2.filter2D(img2 ** 2, -1, window)[5:-5, 5:-5] - mu2_sq
+        sigma12 = cv2.filter2D(img1 * img2, -1, window)[5:-5, 5:-5] - mu1_mu2
+
+        ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / (
+            (mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2)
+        )
+        return float(ssim_map.mean())
     def save(self, milestone):
         if not self.accelerator.is_local_main_process:
             return
@@ -1763,39 +1925,76 @@ class Trainer(object):
 
     @torch.no_grad()
     def validate_fixed(self, max_val_images=20):
+        """
+        按 MCDFormer benchmark 风格统计验证集指标：
+        - pred / gt 转 [0,255]
+        - PSNR / SSIM 同一口径
+        - DF2KVal 走 benchmark=False
+        - Set5 / Set14 / BSDS100 / Urban100 走 benchmark=True
+        """
         self.ema.ema_model.eval()
 
+        dataset_name = self.get_eval_dataset_name()
+        benchmark_mode = self.is_public_benchmark(dataset_name)
+
         psnr_list = []
+        ssim_list = []
 
         for i, items in enumerate(self.val_loader):
             if i >= max_val_images:
                 break
 
-            if self.condition_type == 2:
-                batch = [item.to(self.device) for item in items]
-                gt = batch[0]
-                x_input_sample = batch[1:]
-            elif self.condition_type == 3:
+            if self.condition_type in [2, 3]:
                 batch = [item.to(self.device) for item in items]
                 gt = batch[0]
                 x_input_sample = batch[1:]
             else:
                 continue
 
-            outputs = list(self.ema.ema_model.sample(
-                x_input_sample, batch_size=1, last=True
-            ))
+            outputs = list(
+                self.ema.ema_model.sample(
+                    x_input_sample,
+                    batch_size=1,
+                    last=True
+                )
+            )
             pred = outputs[-1]
 
-            mse = F.mse_loss(pred, gt)
-            psnr = -10 * torch.log10(mse + 1e-8) if mse > 0 else torch.tensor(100.0, device=gt.device)
-            psnr_list.append(psnr.item())
+            # 去掉 pad
+            pad_size = self.sample_dataset.get_pad_size(i)
+            gt = self.remove_pad(gt, pad_size)
+            pred = self.remove_pad(pred, pad_size)
+
+            # 保证尺寸能整除 scale
+            scale = 4
+            gt, pred = self.crop_pair_to_scale(pred, gt, scale)[1], self.crop_pair_to_scale(pred, gt, scale)[0]
+            # 上面写法太绕的话，也可拆成：
+            # pred, gt = self.crop_pair_to_scale(pred, gt, scale)
+
+            pred, gt = self.crop_pair_to_scale(pred, gt, scale)
+
+            # 转到 [0,255]
+            pred_255 = self.quantize_255(pred)
+            gt_255 = self.quantize_255(gt)
+
+            psnr = self.calc_psnr_mcd(pred_255, gt_255, scale=scale, benchmark=benchmark_mode)
+            ssim = self.calc_ssim_mcd(pred_255, gt_255, scale=scale, benchmark=benchmark_mode)
+
+            psnr_list.append(psnr)
+            ssim_list.append(ssim)
 
         if len(psnr_list) > 0:
             mean_psnr = sum(psnr_list) / len(psnr_list)
-            self.writer.add_scalar('Metrics_Validation/PSNR_fixed', mean_psnr, self.step)
-            print(f"[Validation] step={self.step} mean PSNR over {len(psnr_list)} images: {mean_psnr:.4f}")
+            mean_ssim = sum(ssim_list) / len(ssim_list)
 
+            self.writer.add_scalar("Metrics_Validation/PSNR_fixed", mean_psnr, self.step)
+            self.writer.add_scalar("Metrics_Validation/SSIM_fixed", mean_ssim, self.step)
+
+            print(
+                f"[Validation:{dataset_name}] step={self.step} "
+                f"PSNR={mean_psnr:.4f} dB, SSIM={mean_ssim:.4f} "
+                f"over {len(psnr_list)} images (benchmark_mode={benchmark_mode})"
+            )
     def sample(self, milestone, last=True, FID=False):
         self.ema.ema_model.eval()
 
@@ -1877,84 +2076,149 @@ class Trainer(object):
         return milestone
 
     def test(self, sample=False, last=True, FID=False):
+        """
+        按 MCDFormer benchmark 风格测试：
+        - 逐张保存 SR 图
+        - 逐张打印 PSNR / SSIM
+        - 最后汇总平均 PSNR / SSIM
+        """
         print("test start")
+
         if self.condition:
             self.ema.ema_model.eval()
+
             loader = DataLoader(
                 dataset=self.sample_dataset,
-                batch_size=1
+                batch_size=1,
+                shuffle=False,
+                pin_memory=True,
+                num_workers=0
             )
-            i = 0
-            for items in tqdm(loader, desc='testing images', total=len(self.sample_dataset)):
+
+            dataset_name = self.get_eval_dataset_name()
+            benchmark_mode = self.is_public_benchmark(dataset_name)
+
+            psnr_all = []
+            ssim_all = []
+
+            for i, items in enumerate(tqdm(loader, desc=f"testing {dataset_name}", total=len(self.sample_dataset))):
                 if self.condition:
-                    file_name = self.sample_dataset.load_name(
-                        i, sub_dir=self.sub_dir)
+                    file_name = self.sample_dataset.load_name(i, sub_dir=self.sub_dir)
                 else:
-                    file_name = f'{i}.png'
-                print(f"[Test] [{i + 1:04d}/{len(self.sample_dataset):04d}] -> {file_name}")
-                
+                    file_name = f"{i}.png"
 
                 with torch.no_grad():
-                    batches = self.num_samples
-
                     if self.condition_type == 0:
                         x_input_sample = [0]
                         show_x_input_sample = []
                     elif self.condition_type == 1:
                         x_input_sample = [items.to(self.device)]
                         show_x_input_sample = x_input_sample
-                    elif self.condition_type == 2:
-                        x_input_sample = [item.to(self.device)
-                                          for item in items]
-                        show_x_input_sample = x_input_sample
-                        x_input_sample = x_input_sample[1:]
-                    elif self.condition_type == 3:
-                        x_input_sample = [item.to(self.device)
-                                          for item in items]
+                    elif self.condition_type in [2, 3]:
+                        x_input_sample = [item.to(self.device) for item in items]
                         show_x_input_sample = x_input_sample
                         x_input_sample = x_input_sample[1:]
 
-                    if sample:
-                        all_images_list = show_x_input_sample + \
-                            list(self.ema.ema_model.sample(
-                                x_input_sample, batch_size=batches))
-                    else:
-                        all_images_list = list(self.ema.ema_model.sample(
-                            x_input_sample, batch_size=batches, last=last))
-                        all_images_list = [all_images_list[-1]]
-                        if self.crop_patch:
-                            k = 0
-                            for img in all_images_list:
-                                pad_size = self.sample_dataset.get_pad_size(i)
-                                _, _, h, w = img.shape
-                                img = img[:, :, 0:h -
-                                          pad_size[0], 0:w-pad_size[1]]
-                                all_images_list[k] = img
-                                k += 1
-                        
+                    outputs = list(
+                        self.ema.ema_model.sample(
+                            x_input_sample,
+                            batch_size=1,
+                            last=last
+                        )
+                    )
+                    pred = outputs[-1]
 
-                all_images = torch.cat(all_images_list, dim=0)
+                    gt = None
+                    lq_input = None
+                    if self.condition_type in [2, 3]:
+                        gt = show_x_input_sample[0]
+                        lq_input = show_x_input_sample[1]
 
-                if last:
-                    nrow = int(math.sqrt(self.num_samples))
+                # 去 pad
+                pad_size = self.sample_dataset.get_pad_size(i)
+                pred = self.remove_pad(pred, pad_size)
+
+                if gt is not None:
+                    gt = self.remove_pad(gt, pad_size)
+                if lq_input is not None:
+                    lq_input = self.remove_pad(lq_input, pad_size)
+
+                # crop 到可整除 scale
+                scale = 4
+                if gt is not None:
+                    pred, gt = self.crop_pair_to_scale(pred, gt, scale)
                 else:
-                    nrow = all_images.shape[0]
+                    _, _, h, w = pred.shape
+                    h = int(h // scale * scale)
+                    w = int(w // scale * scale)
+                    pred = pred[:, :, :h, :w]
 
-                utils.save_image(all_images, str(
-                    self.results_folder / file_name), nrow=nrow)
-                print("test-save "+file_name)
-                i += 1
+                # 保存结果图（保存 0~1 的 pred 即可）
+                save_path = str(self.results_folder / file_name)
+                utils.save_image(pred, save_path, nrow=1)
+
+                # 计算指标
+                if gt is not None:
+                    pred_255 = self.quantize_255(pred)
+                    gt_255 = self.quantize_255(gt)
+
+                    psnr = self.calc_psnr_mcd(
+                        pred_255, gt_255,
+                        scale=scale,
+                        benchmark=benchmark_mode
+                    )
+                    ssim = self.calc_ssim_mcd(
+                        pred_255, gt_255,
+                        scale=scale,
+                        benchmark=benchmark_mode
+                    )
+
+                    psnr_all.append(psnr)
+                    ssim_all.append(ssim)
+
+                    print(
+                        f"[Test:{dataset_name}] [{i + 1:04d}/{len(self.sample_dataset):04d}] "
+                        f"{file_name} | PSNR: {psnr:.4f} dB | SSIM: {ssim:.4f}"
+                    )
+                else:
+                    print(
+                        f"[Test:{dataset_name}] [{i + 1:04d}/{len(self.sample_dataset):04d}] "
+                        f"{file_name} | saved"
+                    )
+
+            if len(psnr_all) > 0:
+                mean_psnr = sum(psnr_all) / len(psnr_all)
+                mean_ssim = sum(ssim_all) / len(ssim_all)
+
+                print("\n================ Final Benchmark Result ================")
+                print(
+                    f"{dataset_name} | Mean PSNR: {mean_psnr:.4f} dB | "
+                    f"Mean SSIM: {mean_ssim:.4f} | benchmark_mode={benchmark_mode}"
+                )
+
+                metric_file = self.results_folder / f"metrics_{dataset_name}.txt"
+                with open(metric_file, "w", encoding="utf-8") as f:
+                    f.write(f"Dataset: {dataset_name}\n")
+                    f.write(f"Benchmark mode: {benchmark_mode}\n")
+                    f.write(f"Mean PSNR: {mean_psnr:.6f} dB\n")
+                    f.write(f"Mean SSIM: {mean_ssim:.6f}\n")
+                    f.write(f"Images: {len(psnr_all)}\n")
+
+                print(f"Metrics saved to: {metric_file}")
+
         else:
             if FID:
                 self.total_n_samples = 50000
                 img_id = len(glob.glob(f"{self.results_folder}/*"))
-                n_rounds = (self.total_n_samples - img_id) // self.num_samples+1
+                n_rounds = (self.total_n_samples - img_id) // self.num_samples + 1
             else:
                 n_rounds = 100
+
             for i in range(n_rounds):
                 if FID:
                     i = img_id
                 img_id = self.sample(i, last=last, FID=FID)
+
         print("test end")
 
     def set_results_folder(self, path):
