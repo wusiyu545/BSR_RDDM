@@ -134,14 +134,14 @@ def build_expert_target_sr_x4(deg_info):
 
     # E3: downsample + stronger noise + detail regeneration
     # 不要让 resize 一票压死所有样本
-    t[3] += 0.55 * resize_strength
-    t[3] += 0.75 * noise_strength
+    t[3] += 0.20 * resize_strength
+    t[3] += 0.45 * noise_strength
 
     # 如果压缩很弱且 blur 很弱，但有下采样，E3 保底承担细节补偿
     if resize_strength > 0 and blur_strength < 0.25 and jpeg_strength < 0.2:
-        t[3] += 0.15
+        t[3] += 0.05
 
-    t += 0.05
+    t += 0.03
     t /= t.sum()
     return t.astype(np.float32)
 

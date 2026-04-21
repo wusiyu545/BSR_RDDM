@@ -39,9 +39,9 @@ class SoftDecisionTree(nn.Module):
 
         # --- 🌟 温度退火超参数设定 ---
         self.temp_max = 1.0    # 初始最高温度
-        self.temp_min = 0.1    # 最终最低温度
+        self.temp_min = 0.2    # 最终最低温度
         self.warmup_ratio = 0.1 # 前 10% 步数为高温探索期
-        self.hold_ratio = 0.8   # 前 80% 完成退火，最后 20% 保持低温
+        self.hold_ratio = 0.9   # 前 90% 完成退火，最后 10% 保持低温
 
         # --- 运行时监控缓存 ---
         self.last_temperature = None

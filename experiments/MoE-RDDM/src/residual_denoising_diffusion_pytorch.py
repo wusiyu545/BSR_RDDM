@@ -1204,13 +1204,14 @@ class ResidualDiffusion(nn.Module):
             raise ValueError(f'invalid loss type {self.loss_type}')
 
     def get_expert_prior_weight(self, current_step):
-        if current_step < 15000:
-            return 0.15
-        elif current_step < 30000:
-            # 0.15 -> 0.03 线性衰减
-            return 0.15 - (current_step - 15000) * (0.12 / 15000.0)
+        # 最小修正版：先给一点引导，但很快退弱
+        if current_step < 4000:
+            return 0.03
+        elif current_step < 12000:
+            # 0.03 -> 0.005 线性衰减
+            return 0.03 - (current_step - 4000) * (0.025 / 8000.0)
         else:
-            return 0.01
+            return 0.005
     def p_losses(self, imgs, t, noise=None, current_step=0, total_steps=None):
         total_steps = 20000 if total_steps is None else total_steps
 
