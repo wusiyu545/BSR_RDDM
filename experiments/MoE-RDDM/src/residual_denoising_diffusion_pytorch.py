@@ -240,10 +240,50 @@ class ResnetBlock(nn.Module):
         h = self.block2(h)
 
         return h + self.res_conv(x)
+    
+class ContentPriorEncoder(nn.Module):
+    """
+    轻量内容先验编码器：
+    输入 degraded / upsampled LQ，输出 [B, num_experts] 的 content logits。
+    
+    作用：
+    让 MoE 路由不仅看退化强度，也看图像内容复杂度。
+    """
+    def __init__(self, in_channels=3, num_experts=4, base_dim=32):
+        super().__init__()
 
+        self.encoder = nn.Sequential(
+            nn.Conv2d(in_channels, base_dim, kernel_size=3, stride=2, padding=1),
+            nn.GroupNorm(4, base_dim),
+            nn.GELU(),
+
+            nn.Conv2d(base_dim, base_dim * 2, kernel_size=3, stride=2, padding=1),
+            nn.GroupNorm(8, base_dim * 2),
+            nn.GELU(),
+
+            nn.Conv2d(base_dim * 2, base_dim * 4, kernel_size=3, stride=2, padding=1),
+            nn.GroupNorm(8, base_dim * 4),
+            nn.GELU(),
+
+            nn.AdaptiveAvgPool2d(1)
+        )
+
+        self.fc = nn.Linear(base_dim * 4, num_experts)
+
+    def forward(self, x):
+        """
+        x: [B, 3, H, W]，建议输入 x_input，也就是 upsampled LQ。
+        return: [B, num_experts]
+        """
+        feat = self.encoder(x).flatten(1)
+        logits = self.fc(feat)
+
+        # 稳定一点，去均值，避免 content logits 初期偏置太大
+        logits = logits - logits.mean(dim=-1, keepdim=True)
+        return logits
 
 class SDTFeatureRouter(nn.Module):
-    def __init__(self, dim, num_experts=4, init_sdt_scale=2.0, temperature=1.0):
+    def __init__(self, dim, num_experts=4, init_sdt_scale=2.0, temperature=1.0, init_content_scale=0.3):
         super().__init__()
         self.num_experts = num_experts
         self.temperature = temperature
@@ -255,33 +295,33 @@ class SDTFeatureRouter(nn.Module):
             nn.Linear(dim // 2, num_experts)
         )
 
-        # =======================================================
-        # 🚀 核心升级：可学习的动态尺度参数 (Learnable Scale)
-        # 初始化为较高的 2.0，确保训练初期 SDT 拥有绝对指挥权。
-        # 随着训练推进，网络会自动为不同的 U-Net 深度层学出最完美的平衡比例！
-        # =======================================================
         self.sdt_scale = nn.Parameter(torch.tensor(init_sdt_scale))
 
-    def forward(self, x, sdt_probs=None):
+        # 新增：内容先验的融合强度
+        # 初始不要太大，避免 content prior 一开始压过 SDT 和局部特征
+        self.content_scale = nn.Parameter(torch.tensor(init_content_scale))
+
+    def forward(self, x, sdt_probs=None, content_logits=None):
         """
         x: [B, C, H, W]
         sdt_probs: [B, E] or None
+        content_logits: [B, E] or None
         """
-        feat = self.pool(x).flatten(1)  # [B, C]
-        feat_logits = self.fc(feat)  # [B, E]
-
+        feat = self.pool(x).flatten(1)
+        feat_logits = self.fc(feat)
         feat_logits = feat_logits - feat_logits.mean(dim=-1, keepdim=True)
+
+        logits = feat_logits
 
         if sdt_probs is not None:
             sdt_logits = torch.log(sdt_probs.clamp_min(1e-8))
+            actual_sdt_scale = F.relu(self.sdt_scale)
+            logits = logits + actual_sdt_scale * sdt_logits
 
-            # 🛡️ 保护机制：使用 F.relu 确保 scale 永远是非负数
-            # 防止网络走火入魔学出负数，导致 SDT 逻辑完全反转
-            actual_scale = F.relu(self.sdt_scale)
-
-            logits = feat_logits + actual_scale * sdt_logits
-        else:
-            logits = feat_logits
+        if content_logits is not None:
+            content_logits = content_logits - content_logits.mean(dim=-1, keepdim=True)
+            actual_content_scale = F.relu(self.content_scale)
+            logits = logits + actual_content_scale * content_logits
 
         weights = F.softmax(logits / self.temperature, dim=-1)
         return weights, logits, feat_logits
@@ -332,7 +372,7 @@ class MoEResnetBlock(nn.Module):
                     layers.append(ResnetBlock(in_d, dim_out, time_emb_dim=time_emb_dim, groups=groups))
                 self.experts.append(nn.ModuleList(layers))
 
-    def forward(self, x, time_emb=None, sdt_weights=None):
+    def forward(self, x, time_emb=None, sdt_weights=None, content_logits=None):
         # 1. 如果开启了并联共享，先计算共享特征
         if self.use_shared:
             y_shared = self.shared_block(x, time_emb)
@@ -350,26 +390,28 @@ class MoEResnetBlock(nn.Module):
                     out_e = layer(out_e, time_emb)
             expert_outputs.append(out_e)
 
-        # 3. 拦截并净化来自司令部 (SDT) 的全局概率
-        clean_sdt_probs = get_sdt_probs(sdt_weights, num_experts=self.num_experts, is_logits=False)
+        # 3. SDT 概率净化
+        clean_sdt_probs = get_sdt_probs(
+            sdt_weights,
+            num_experts=self.num_experts,
+            is_logits=False
+        )
 
-        # 4. 核心路由决策：司令部概率 + 局部特征 = 最终权重
-        # 这里的 weights 是 [B, E]
-        weights, logits, feat_logits = self.router(x, sdt_probs=clean_sdt_probs)
+        # 4. 融合 SDT prior + content prior + local feature
+        weights, logits, feat_logits = self.router(
+            x,
+            sdt_probs=clean_sdt_probs,
+            content_logits=content_logits
+        )
 
-        # =========================================================
-        # 🚀 新增：微观状态探针
-        # 将当前 batch、当前深度的真实分配权重缓存下来，供外部计算真实负载均衡
-        # =========================================================
         self.last_weights = weights
 
-        # 5. Soft MoE 加权融合
+        # 5. Soft MoE 融合
         y_expert = 0
         for i, exp_out in enumerate(expert_outputs):
             w = weights[:, i].view(-1, 1, 1, 1)
             y_expert += w * exp_out
 
-        # 6. 返回最终结果 (兼容 U-Net 原生数据流格式)
         return y_shared + y_expert
 
 
@@ -730,7 +772,7 @@ class UnetRes(nn.Module):
                               learned_sinusoidal_dim=learned_sinusoidal_dim, condition=condition,
                               input_condition=input_condition)
 
-    def forward(self, x, time, x_self_cond=None, sdt_weights=None):
+    def forward(self, x, time, x_self_cond=None, sdt_weights=None, content_logits=None):
         if self.share_encoder == 1:
             if self.self_condition:
                 x_self_cond = default(x_self_cond, lambda: torch.zeros_like(x))
@@ -758,14 +800,24 @@ class UnetRes(nn.Module):
                 out_res = block1(out_res, t)
 
                 if isinstance(block2, MoEResnetBlock):
-                    out_res = block2(out_res, t, sdt_weights=sdt_weights)
+                        out_res = block2(
+                            out_res,
+                            t,
+                            sdt_weights=sdt_weights,
+                            content_logits=content_logits
+                        )
                 else:
                     out_res = block2(out_res, t)
 
                 out_res = attn(out_res)
                 out_res = upsample(out_res)
             # 🚀 最后一层：高维专家处理特征，单头输出像素
-            out_res = self.final_res_block_1(out_res, t, sdt_weights=sdt_weights)
+            out_res = self.final_res_block_1(
+                out_res,
+                t,
+                sdt_weights=sdt_weights,
+                content_logits=content_logits
+            )
             out_res_conv1 = self.final_conv_1(out_res)
 
             for block1, block2, attn, upsample in self.ups:
@@ -778,7 +830,12 @@ class UnetRes(nn.Module):
 
             x = torch.cat((x, r), dim=1)
             # 🚀 第二个分支同理
-            x = self.final_res_block_2(x, t, sdt_weights=sdt_weights)
+            x = self.final_res_block_2(
+                x,
+                t,
+                sdt_weights=sdt_weights,
+                content_logits=content_logits
+            )
             out_res_add_noise = self.final_conv_2(x)
 
             return out_res_conv1, out_res_add_noise
@@ -849,9 +906,16 @@ class ResidualDiffusion(nn.Module):
         self.last_expert_prior_loss = None
         self.last_expert_prior_weight = None
         # 【新增代码】：当开启 input_condition 时，初始化软决策树
+        
         if self.input_condition:
             self.sdt = SoftDecisionTree(in_channels=self.channels, num_experts=4)
 
+            # 新增：内容先验编码器
+            self.content_encoder = ContentPriorEncoder(
+                in_channels=self.channels,
+                num_experts=4,
+                base_dim=32
+            )
         if self.condition:
             self.sum_scale = sum_scale if sum_scale else 0.01
             ddim_sampling_eta = 0.
@@ -935,15 +999,23 @@ class ResidualDiffusion(nn.Module):
             self.posterior_log_variance_clipped, t, x_t.shape)
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
-    def model_predictions(self, x_input, x, t, sdt_weights=None, x_self_cond=None, clip_denoised=True):
+    def model_predictions(self, x_input, x, t, sdt_weights=None, x_self_cond=None, clip_denoised=True, content_logits=None):
         if not self.condition:
             x_in = x
         else:
             x_in = torch.cat((x, x_input), dim=1)
-        model_output = self.model(x_in,
-                                  t,
-                                  x_self_cond,
-                                  sdt_weights=sdt_weights)
+
+        # 如果外面没有传 content_logits，就在这里由 x_input 生成
+        if self.input_condition and content_logits is None:
+            content_logits = self.content_encoder(x_input)
+
+        model_output = self.model(
+            x_in,
+            t,
+            x_self_cond,
+            sdt_weights=sdt_weights,
+            content_logits=content_logits
+        )
         maybe_clip = partial(torch.clamp, min=-1.,
                              max=1.) if clip_denoised else identity
 
@@ -1011,12 +1083,18 @@ class ResidualDiffusion(nn.Module):
     @torch.no_grad()
     def p_sample_loop(self, x_input, shape, last=True):
         if self.input_condition:
-            # 🚀 兼容三输入采样提取
-            sdt_in = x_input[1] if isinstance(x_input, list) and len(x_input) > 1 else x_input[0]
-            # 【强制满进度】：测试时保证最低温
-            sdt_weights = self.sdt(sdt_in, current_step=1, total_steps=1)
+            sdt_in = x_extra_cond if x_extra_cond is not None else x_input
+            sdt_weights = self.sdt(
+                sdt_in,
+                current_step=current_step,
+                total_steps=total_steps
+            )
+
+            # 新增：内容先验
+            content_logits = self.content_encoder(x_input)
         else:
             sdt_weights = None
+            content_logits = None
         x_input = x_input[0] if isinstance(x_input, list) else x_input
 
         batch, device = shape[0], self.betas.device
@@ -1355,7 +1433,6 @@ class ResidualDiffusion(nn.Module):
             expert_target = None
 
             if len(imgs) >= 3:
-                # [B,C,H,W] 视作额外图像条件；[B,4] 视作 expert_target
                 if torch.is_tensor(imgs[2]) and imgs[2].dim() == 4:
                     x_extra_cond = imgs[2]
                 elif torch.is_tensor(imgs[2]) and imgs[2].dim() == 2:
@@ -1367,15 +1444,25 @@ class ResidualDiffusion(nn.Module):
 
             if self.input_condition:
                 sdt_in = x_extra_cond if x_extra_cond is not None else x_input
-                sdt_weights = self.sdt(sdt_in, current_step=current_step, total_steps=total_steps)
+                sdt_weights = self.sdt(
+                    sdt_in,
+                    current_step=current_step,
+                    total_steps=total_steps
+                )
+
+                # 新增：内容先验 logits
+                content_logits = self.content_encoder(x_input)
             else:
                 sdt_weights = None
+                content_logits = None
+
         else:  # Generation
             x_input = 0
             x_start = imgs
             x_extra_cond = None
             expert_target = None
             sdt_weights = None
+            content_logits = None
 
 
         noise = default(noise, lambda: torch.randn_like(x_start))
@@ -1391,7 +1478,12 @@ class ResidualDiffusion(nn.Module):
         if self.self_condition and random.random() < 0.5:
             with torch.no_grad():
                 x_self_cond = self.model_predictions(
-                    x_input, x, t, sdt_weights=sdt_weights if self.input_condition else None).pred_x_start
+                    x_input,
+                    x,
+                    t,
+                    sdt_weights=sdt_weights if self.input_condition else None,
+                    content_logits=content_logits if self.input_condition else None
+                ).pred_x_start
                 x_self_cond.detach_()
 
         # predict and take gradient step
@@ -1401,10 +1493,13 @@ class ResidualDiffusion(nn.Module):
             x_in = torch.cat((x, x_input), dim=1)
 
 
-        model_out = self.model(x_in,
-                               t,
-                               x_self_cond,
-                               sdt_weights=sdt_weights)
+        model_out = self.model(
+            x_in,
+            t,
+            x_self_cond,
+            sdt_weights=sdt_weights,
+            content_logits=content_logits
+        )
 
         target = []
         if self.objective == 'pred_res_noise':
