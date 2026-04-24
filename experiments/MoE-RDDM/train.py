@@ -41,7 +41,7 @@ if debug:
     sampling_timesteps_original_ddim_ddpm = 10
     train_num_steps = 200
 else:
-    save_and_sample_every = 1000
+    save_and_sample_every = 5000
     if len(sys.argv) > 1:
         sampling_timesteps = int(sys.argv[1])
     else:

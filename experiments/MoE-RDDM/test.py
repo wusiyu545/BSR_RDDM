@@ -22,15 +22,37 @@ if debug:
     save_and_sample_every = 10
     sampling_timesteps = 10
     sampling_timesteps_original_ddim_ddpm = 10
-    train_num_steps = 20  # 占位，test 不训练
+    train_num_steps = 20
 else:
     save_and_sample_every = 10
+
+    # argv[1] = sampling timesteps
     if len(sys.argv) > 1:
         sampling_timesteps = int(sys.argv[1])
     else:
         sampling_timesteps = 50
+
+    # argv[2] = eval sigma
+    if len(sys.argv) > 2:
+        EVAL_SIGMA = float(sys.argv[2])
+    else:
+        EVAL_SIGMA = 0.0
+
+    # argv[3] = benchmark name
+    if len(sys.argv) > 3:
+        BENCHMARK_NAME = str(sys.argv[3])
+    else:
+        BENCHMARK_NAME = "Set5"
+
     sampling_timesteps_original_ddim_ddpm = 250
-    train_num_steps = 20  # 占位，test 不训练
+    train_num_steps = 20
+
+# 传给 base.py 的 Dataset 使用
+os.environ["MOE_EVAL_SIGMA"] = str(EVAL_SIGMA)
+
+print(f"[Test Config] sampling_timesteps={sampling_timesteps}")
+print(f"[Test Config] EVAL_SIGMA={EVAL_SIGMA}")
+print(f"[Test Config] BENCHMARK_NAME={BENCHMARK_NAME}")
 
 original_ddim_ddpm = False
 if original_ddim_ddpm:
@@ -44,8 +66,6 @@ else:
 
 if condition:
 
-    #测试集
-    BENCHMARK_NAME = "Set5"
 
     train_hr_flist = "./data/DF2K/train_hr.flist"
     test_hr_flist = f"./data/benchmark_flist/{BENCHMARK_NAME}_hr.flist"
@@ -100,9 +120,9 @@ else:
         input_condition=input_condition,
         input_condition_mask=input_condition_mask,
     )
-
+#模型权重目录
 # 必须和当前 train.py 的 results_dir 一致
-results_dir = './results/MoE_SDT_Stage1_Debug'
+results_dir = './results/MoE_SDT_BlindSR_x4_DF2K_alignMCD'
 
 trainer = Trainer(
     diffusion,
@@ -148,5 +168,5 @@ if __name__ == "__main__":
             raise FileNotFoundError(f"\n❌ 没有在 {results_dir} 里找到任何 model-*.pt")
 
         # 单独输出到测试目录，避免覆盖训练目录
-        trainer.set_results_folder(f'./results/test_stage1_debug_t{sampling_timesteps}')
+        trainer.set_results_folder(f'./results/test_{BENCHMARK_NAME}_sig{EVAL_SIGMA}_t{sampling_timesteps}')
         trainer.test(last=True)
