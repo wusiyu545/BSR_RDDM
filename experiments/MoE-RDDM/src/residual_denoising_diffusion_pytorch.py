@@ -1083,18 +1083,18 @@ class ResidualDiffusion(nn.Module):
     @torch.no_grad()
     def p_sample_loop(self, x_input, shape, last=True):
         if self.input_condition:
-            sdt_in = x_extra_cond if x_extra_cond is not None else x_input
+            # 采样阶段 x_input 通常是 [LQ]
+            # 如果以后扩展成 [LQ, extra_cond]，则优先用 extra_cond 给 SDT
+            sdt_in = x_input[1] if isinstance(x_input, list) and len(x_input) > 1 else x_input[0]
             sdt_weights = self.sdt(
                 sdt_in,
-                current_step=current_step,
-                total_steps=total_steps
+                current_step=1,
+                total_steps=1
             )
-
-            # 新增：内容先验
-            content_logits = self.content_encoder(x_input)
         else:
             sdt_weights = None
-            content_logits = None
+
+        # 真正喂给 RDDM 的条件图像
         x_input = x_input[0] if isinstance(x_input, list) else x_input
 
         batch, device = shape[0], self.betas.device
