@@ -640,7 +640,8 @@ class UnetRes(nn.Module):
                 groups=resnet_block_groups,
                 num_experts=4,
                 expert_depth=1,
-                temperature=0.7
+                init_sdt_scale=0.8,
+                temperature=1.0
             )
 
             # ======================== 构建 Downs ========================
@@ -659,9 +660,12 @@ class UnetRes(nn.Module):
             self.mid_attn = Residual(PreNorm(mid_dim, Attention(mid_dim)))
             self.mid_block2 = block_klass(mid_dim, mid_dim, time_emb_dim=time_dim)
 
+
             # ======================== 构建 Ups ========================
+            num_up_stages = len(in_out)
+
             for ind, (dim_in, dim_out) in enumerate(reversed(in_out)):
-                is_last = ind == (len(in_out) - 1)
+                is_last = ind == (num_up_stages - 1)
 
                 self.ups.append(nn.ModuleList([
                     block_klass(dim_out + dim_in, dim_out, time_emb_dim=time_dim),
@@ -670,14 +674,30 @@ class UnetRes(nn.Module):
                     Upsample(dim_out, dim_in) if not is_last else nn.Conv2d(dim_out, dim_in, 3, padding=1)
                 ]))
 
-                # 🚀 将 ups_no_skip 的第二个块升级为特征专家
+                # =========================================================
+                # 只在最高分辨率 decoder stage 使用 MoE
+                # ind == num_up_stages - 1 对应最后一个 up stage，空间分辨率最高
+                # 前面的低分辨率 decoder stage 使用普通 ResnetBlock，降低计算量
+                # =========================================================
+                if is_last:
+                    second_block = moe_block_klass(
+                        dim_out,
+                        dim_out,
+                        time_emb_dim=time_dim
+                    )
+                else:
+                    second_block = block_klass(
+                        dim_out,
+                        dim_out,
+                        time_emb_dim=time_dim
+                    )
+
                 self.ups_no_skip.append(nn.ModuleList([
                     block_klass(dim_out, dim_out, time_emb_dim=time_dim),
-                    moe_block_klass(dim_out, dim_out, time_emb_dim=time_dim),  # <--- 特征级专家
+                    second_block,
                     Residual(PreNorm(dim_out, LinearAttention(dim_out))),
                     Upsample(dim_out, dim_in) if not is_last else nn.Conv2d(dim_out, dim_in, 3, padding=1)
                 ]))
-
             # ======================== 构建 Final ========================
             out_dim = default(out_dim, channels)
             self.out_dim = out_dim
@@ -734,13 +754,16 @@ class UnetRes(nn.Module):
             x = self.mid_block2(x, t)
 
             out_res = x
-            for block1, block2_moe, attn, upsample in self.ups_no_skip:
+            for block1, block2, attn, upsample in self.ups_no_skip:
                 out_res = block1(out_res, t)
-                # 🚀 把 SDT 权重喂给内部专家
-                out_res = block2_moe(out_res, t, sdt_weights=sdt_weights)
+
+                if isinstance(block2, MoEResnetBlock):
+                    out_res = block2(out_res, t, sdt_weights=sdt_weights)
+                else:
+                    out_res = block2(out_res, t)
+
                 out_res = attn(out_res)
                 out_res = upsample(out_res)
-
             # 🚀 最后一层：高维专家处理特征，单头输出像素
             out_res = self.final_res_block_1(out_res, t, sdt_weights=sdt_weights)
             out_res_conv1 = self.final_conv_1(out_res)
@@ -1212,6 +1235,115 @@ class ResidualDiffusion(nn.Module):
             return 0.03 - (current_step - 4000) * (0.025 / 8000.0)
         else:
             return 0.005
+        
+
+    def get_expert_prior_weight(self):
+        """
+        expert target loss 衰减：
+        0~2k:      0.01
+        2k~10k:    0.01 -> 0.002
+        10k以后:   0.001
+        """
+        step = int(getattr(self, "current_train_step", 0))
+
+        if step < 2000:
+            return 0.01
+
+        if step < 10000:
+            ratio = (step - 2000) / float(10000 - 2000)
+            return 0.01 * (1.0 - ratio) + 0.002 * ratio
+
+        return 0.001
+
+
+    def get_balance_weight(self):
+        """
+        load balance 只作为防塌缩约束，不要太强。
+        """
+        step = int(getattr(self, "current_train_step", 0))
+
+        if step < 5000:
+            return 0.003
+
+        return 0.001
+
+
+    def kl_prob_loss(self, probs, target):
+        """
+        probs:  [B, E], 已经 softmax
+        target: [B, E], soft target
+        """
+        probs = probs.clamp_min(1e-8)
+        target = target.clamp_min(1e-8)
+        target = target / target.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+
+        return F.kl_div(
+            probs.log(),
+            target,
+            reduction="batchmean"
+        )
+
+
+    def collect_moe_weights(self):
+        """
+        收集所有 MoEResnetBlock 的 last_weights。
+        每个 MoEResnetBlock forward 后会缓存 last_weights。
+        """
+        weights = []
+        for m in self.model.modules():
+            if isinstance(m, MoEResnetBlock) and hasattr(m, "last_weights"):
+                weights.append(m.last_weights)
+
+        return weights
+
+
+    def compute_expert_prior_loss(self, expert_target, sdt_weights=None):
+        """
+        同时监督：
+        1) SDT 全局路由权重
+        2) MoE block 真实专家权重
+
+        这样能让 SDT / MoE 前期学会按 sigma 分工。
+        """
+        if expert_target is None:
+            return None, None
+
+        expert_target = expert_target.float()
+        expert_target = expert_target / expert_target.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+
+        loss_list = []
+
+        # 1) 监督 SDT 权重
+        if sdt_weights is not None:
+            sdt_probs = get_sdt_probs(sdt_weights, num_experts=expert_target.shape[-1], is_logits=False)
+            if sdt_probs is not None:
+                loss_list.append(self.kl_prob_loss(sdt_probs, expert_target))
+
+        # 2) 监督各个 MoE block 的真实权重
+        moe_weights = self.collect_moe_weights()
+        for w in moe_weights:
+            loss_list.append(self.kl_prob_loss(w, expert_target))
+
+        if len(loss_list) == 0:
+            return None, None
+
+        expert_prior_loss = sum(loss_list) / len(loss_list)
+
+        # 3) 弱 load balance，防止塌缩
+        balance_losses = []
+        for w in moe_weights:
+            mean_usage = w.mean(dim=0)
+            uniform = torch.full_like(mean_usage, 1.0 / mean_usage.numel())
+            balance_losses.append(F.mse_loss(mean_usage, uniform))
+
+        if len(balance_losses) > 0:
+            balance_loss = sum(balance_losses) / len(balance_losses)
+        else:
+            balance_loss = None
+
+        return expert_prior_loss, balance_loss
+
+
     def p_losses(self, imgs, t, noise=None, current_step=0, total_steps=None):
         total_steps = 20000 if total_steps is None else total_steps
 
@@ -1922,6 +2054,158 @@ class Trainer(object):
                 pbar.update(1)
 
         accelerator.print('training complete')
+
+
+    def get_eval_dataset_name(self):
+        if not hasattr(self, "sample_dataset"):
+            return "Unknown"
+        if not hasattr(self.sample_dataset, "gt"):
+            return "Unknown"
+        if len(self.sample_dataset.gt) == 0:
+            return "Unknown"
+
+        p = str(self.sample_dataset.gt[0]).replace("\\", "/")
+        parts = p.split("/")
+
+        if "benchmark" in parts:
+            idx = parts.index("benchmark")
+            if idx + 1 < len(parts):
+                return parts[idx + 1]
+
+        return "Unknown"
+
+
+    def is_benchmark_metric(self, dataset_name):
+        """
+        为了和 MCDFormer benchmark 口径一致：
+        Set5 / Set14 / B100 / BSDS100 / Urban100 使用 benchmark=True。
+        DF2KVal 如果你也放在 benchmark/DF2KVal/HR 下，为了验证口径统一，也可设为 True。
+        """
+        benchmark_sets = {
+            "Set5", "Set14", "B100", "BSDS100", "Urban100", "DF2KVal"
+        }
+        return dataset_name in benchmark_sets
+
+
+    def quantize_255(self, img):
+        """
+        输入 [0,1]，输出 [0,255]，round + clamp。
+        对齐 MCDFormer utility.quantize 的效果。
+        """
+        return img.mul(255.0).clamp(0, 255).round()
+
+
+    def remove_pad(self, img, pad_size):
+        bottom, right = pad_size
+        _, _, h, w = img.shape
+
+        h_end = h - bottom if bottom > 0 else h
+        w_end = w - right if right > 0 else w
+
+        return img[:, :, :h_end, :w_end]
+
+
+    def crop_pair_to_scale(self, sr, hr, scale=4):
+        """
+        保证 SR / HR 尺寸能被 scale 整除。
+        """
+        _, _, h, w = hr.shape
+        h = int(h // scale * scale)
+        w = int(w // scale * scale)
+
+        sr = sr[:, :, :h, :w]
+        hr = hr[:, :, :h, :w]
+        return sr, hr
+
+
+    def calc_psnr_mcd(self, sr_255, hr_255, scale=4, benchmark=True):
+        """
+        对齐 MCDFormer 的 calc_psnr:
+        - benchmark=True: shave = scale，且转 Y 通道
+        - benchmark=False: shave = scale + 6
+        """
+        diff = (sr_255 - hr_255).div(255.0)
+
+        if benchmark:
+            shave = scale
+            if diff.size(1) > 1:
+                convert = diff.new_zeros(1, 3, 1, 1)
+                convert[0, 0, 0, 0] = 65.738
+                convert[0, 1, 0, 0] = 129.057
+                convert[0, 2, 0, 0] = 25.064
+                diff = diff.mul(convert).div(256.0)
+                diff = diff.sum(dim=1, keepdim=True)
+        else:
+            shave = scale + 6
+
+        shave = int(math.ceil(shave))
+
+        if diff.size(-2) <= 2 * shave or diff.size(-1) <= 2 * shave:
+            valid = diff
+        else:
+            valid = diff[:, :, shave:-shave, shave:-shave]
+
+        mse = valid.pow(2).mean().item()
+        if mse <= 1e-12:
+            return 100.0
+
+        return -10 * math.log10(mse)
+
+
+    def calc_ssim_mcd(self, sr_255, hr_255, scale=4, benchmark=True):
+        """
+        对齐 MCDFormer 的 SSIM:
+        - 输入 [0,255]
+        - 转 Y 通道
+        - benchmark=True 时 border=scale
+        """
+        border = int(math.ceil(scale)) if benchmark else int(math.ceil(scale) + 6)
+
+        img1 = sr_255.data.squeeze().float().clamp(0, 255).round().cpu().numpy()
+        img2 = hr_255.data.squeeze().float().clamp(0, 255).round().cpu().numpy()
+
+        img1 = np.transpose(img1, (1, 2, 0))
+        img2 = np.transpose(img2, (1, 2, 0))
+
+        img1_y = np.dot(img1, [65.738, 129.057, 25.064]) / 255.0 + 16.0
+        img2_y = np.dot(img2, [65.738, 129.057, 25.064]) / 255.0 + 16.0
+
+        h, w = img1_y.shape[:2]
+        if h > 2 * border and w > 2 * border:
+            img1_y = img1_y[border:h - border, border:w - border]
+            img2_y = img2_y[border:h - border, border:w - border]
+
+        return self.ssim_np(img1_y, img2_y)
+
+
+    def ssim_np(self, img1, img2):
+        C1 = (0.01 * 255) ** 2
+        C2 = (0.03 * 255) ** 2
+
+        img1 = img1.astype(np.float64)
+        img2 = img2.astype(np.float64)
+
+        kernel = cv2.getGaussianKernel(11, 1.5)
+        window = np.outer(kernel, kernel.transpose())
+
+        mu1 = cv2.filter2D(img1, -1, window)[5:-5, 5:-5]
+        mu2 = cv2.filter2D(img2, -1, window)[5:-5, 5:-5]
+
+        mu1_sq = mu1 ** 2
+        mu2_sq = mu2 ** 2
+        mu1_mu2 = mu1 * mu2
+
+        sigma1_sq = cv2.filter2D(img1 ** 2, -1, window)[5:-5, 5:-5] - mu1_sq
+        sigma2_sq = cv2.filter2D(img2 ** 2, -1, window)[5:-5, 5:-5] - mu2_sq
+        sigma12 = cv2.filter2D(img1 * img2, -1, window)[5:-5, 5:-5] - mu1_mu2
+
+        ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / (
+            (mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2)
+        )
+        return float(ssim_map.mean())
+
+
+
 
     @torch.no_grad()
     def validate_fixed(self, max_val_images=20):

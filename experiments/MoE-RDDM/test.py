@@ -27,27 +27,21 @@ else:
     save_and_sample_every = 10
 
     # argv[1] = sampling timesteps
-    if len(sys.argv) > 1:
-        sampling_timesteps = int(sys.argv[1])
-    else:
-        sampling_timesteps = 50
+if len(sys.argv) > 1:
+    sampling_timesteps = int(sys.argv[1])
+else:
+    sampling_timesteps = 50
 
-    # argv[2] = eval sigma
-    if len(sys.argv) > 2:
-        EVAL_SIGMA = float(sys.argv[2])
-    else:
-        EVAL_SIGMA = 0.0
+if len(sys.argv) > 2:
+    EVAL_SIGMA = float(sys.argv[2])
+else:
+    EVAL_SIGMA = 0.0
 
-    # argv[3] = benchmark name
-    if len(sys.argv) > 3:
-        BENCHMARK_NAME = str(sys.argv[3])
-    else:
-        BENCHMARK_NAME = "Set5"
+if len(sys.argv) > 3:
+    BENCHMARK_NAME = str(sys.argv[3])
+else:
+    BENCHMARK_NAME = "Set5"
 
-    sampling_timesteps_original_ddim_ddpm = 250
-    train_num_steps = 20
-
-# 传给 base.py 的 Dataset 使用
 os.environ["MOE_EVAL_SIGMA"] = str(EVAL_SIGMA)
 
 print(f"[Test Config] sampling_timesteps={sampling_timesteps}")
@@ -133,8 +127,8 @@ trainer = Trainer(
     train_num_steps=train_num_steps,
     gradient_accumulate_every=1,
     ema_decay=0.995,
-    amp=False,
-    fp16=False,
+    amp=True,
+    fp16=True,
     convert_image_to="RGB",
     condition=condition,
     save_and_sample_every=save_and_sample_every,
