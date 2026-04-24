@@ -16,29 +16,6 @@ def convert_image_to_fn(img_type, image):
     return image
 
 
-def degrade_for_eval_bicubic_x4(self, img_gt):
-    """
-    验证 / 测试对齐 MCDFormer 的 bicubic x4 benchmark:
-    - 不加 blur
-    - 不加 noise
-    - 不加 JPEG
-    - 只做 bicubic x4 下采样
-    - 再 bicubic 上采样回 GT 尺寸（为了兼容当前 RDDM 输入）
-    """
-    img = img_gt.astype(np.float32)
-    h, w = img.shape[:2]
-
-    lr_w = max(1, w // self.sr_scale)
-    lr_h = max(1, h // self.sr_scale)
-
-    img_lr = cv2.resize(img, (lr_w, lr_h), interpolation=cv2.INTER_CUBIC)
-    img_lr = np.clip(np.round(img_lr), 0, 255).astype(np.uint8)
-
-    img_lq_up = cv2.resize(img_lr, (w, h), interpolation=cv2.INTER_CUBIC)
-    img_lq_up = np.ascontiguousarray(img_lq_up)
-
-    return img_lq_up
-
 
 
 def _random_iso_gaussian_kernel(kernel_size=21, sig_min=0.2, sig_max=4.0):
@@ -130,6 +107,30 @@ class Dataset(TorchDataset):
         if self.condition in [1, 2]:
             return len(self.input)
         return len(self.paths)
+
+
+    def degrade_for_eval_bicubic_x4(self, img_gt):
+        """
+        验证 / 测试对齐 MCDFormer 的 bicubic x4 benchmark:
+        - 不加 blur
+        - 不加 noise
+        - 不加 JPEG
+        - 只做 bicubic x4 下采样
+        - 再 bicubic 上采样回 GT 尺寸，兼容当前 RDDM 同尺寸条件输入
+        """
+        img = img_gt.astype(np.float32)
+        h, w = img.shape[:2]
+
+        lr_w = max(1, w // self.sr_scale)
+        lr_h = max(1, h // self.sr_scale)
+
+        img_lr = cv2.resize(img, (lr_w, lr_h), interpolation=cv2.INTER_CUBIC)
+        img_lr = np.clip(np.round(img_lr), 0, 255).astype(np.uint8)
+
+        img_lq_up = cv2.resize(img_lr, (w, h), interpolation=cv2.INTER_CUBIC)
+        img_lq_up = np.ascontiguousarray(img_lq_up)
+
+        return img_lq_up
 
     def degrade_for_blind_sr_x4(self, img_gt):
         """

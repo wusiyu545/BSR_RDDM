@@ -43,7 +43,8 @@ else:
     input_condition_mask = False
 
 if condition:
-    
+
+    #测试集
     BENCHMARK_NAME = "Set5"
 
     train_hr_flist = "./data/DF2K/train_hr.flist"
@@ -52,9 +53,13 @@ if condition:
     folder = [
         train_hr_flist,  # 占位
         train_hr_flist,  # 占位
-        test_hr_flist,  # test GT
-        test_hr_flist  # 占位：测试在线退化
+        test_hr_flist,  # test GT / HR
+        test_hr_flist  # 占位，测试时在线 bicubic x4
     ]
+
+
+
+
     train_batch_size = 1   # 这里只是 Trainer 初始化占位
     num_samples = 1        # 测试逐张输出，最省显存
     sum_scale = 0.01

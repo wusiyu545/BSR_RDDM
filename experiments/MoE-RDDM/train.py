@@ -86,10 +86,10 @@ if condition:
     val_hr_flist = "./data/benchmark_flist/DF2KVal_hr.flist"
 
     folder = [
-        train_hr_flist,  # train GT
-        train_hr_flist,  # 占位：训练在线退化
-        val_hr_flist,  # val GT
-        val_hr_flist  # 占位：验证在线退化
+        train_hr_flist,  # train GT / HR
+        train_hr_flist,  # 占位，训练时在线退化
+        val_hr_flist,  # val GT / HR
+        val_hr_flist  # 占位，验证时在线 bicubic x4
     ]
 
     train_batch_size = 2
