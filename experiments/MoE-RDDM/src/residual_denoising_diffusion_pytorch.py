@@ -1225,26 +1225,19 @@ class ResidualDiffusion(nn.Module):
             return F.mse_loss
         else:
             raise ValueError(f'invalid loss type {self.loss_type}')
-
-    def get_expert_prior_weight(self, current_step):
-        # 最小修正版：先给一点引导，但很快退弱
-        if current_step < 4000:
-            return 0.03
-        elif current_step < 12000:
-            # 0.03 -> 0.005 线性衰减
-            return 0.03 - (current_step - 4000) * (0.025 / 8000.0)
-        else:
-            return 0.005
         
 
-    def get_expert_prior_weight(self):
+    def get_expert_prior_weight(self, current_step=None):
         """
         expert target loss 衰减：
         0~2k:      0.01
         2k~10k:    0.01 -> 0.002
         10k以后:   0.001
         """
-        step = int(getattr(self, "current_train_step", 0))
+        if current_step is None:
+            step = int(getattr(self, "current_train_step", 0))
+        else:
+            step = int(current_step)
 
         if step < 2000:
             return 0.01
@@ -1256,11 +1249,14 @@ class ResidualDiffusion(nn.Module):
         return 0.001
 
 
-    def get_balance_weight(self):
+    def get_balance_weight(self, current_step=None):
         """
         load balance 只作为防塌缩约束，不要太强。
         """
-        step = int(getattr(self, "current_train_step", 0))
+        if current_step is None:
+            step = int(getattr(self, "current_train_step", 0))
+        else:
+            step = int(current_step)
 
         if step < 5000:
             return 0.003
@@ -1346,6 +1342,10 @@ class ResidualDiffusion(nn.Module):
 
     def p_losses(self, imgs, t, noise=None, current_step=0, total_steps=None):
         total_steps = 20000 if total_steps is None else total_steps
+
+        # 记录当前训练步数，供 expert prior / balance loss 衰减使用
+        self.current_train_step = int(current_step)
+        self.total_train_steps = int(total_steps)
 
         if isinstance(imgs, list):  # Condition
             x_start = imgs[0]
@@ -1458,84 +1458,59 @@ class ResidualDiffusion(nn.Module):
         loss = reduce(loss, 'b ... -> b (...)', 'mean')
         total_loss = loss.mean()
         # ==========================================================
-        # 🚀 智能动态负载均衡 (Micro-Level Dynamic Load Balancing)
+        # Sigma soft expert target + decayed expert prior loss
+        # 作用：
+        # 前期用 sigma soft target 引导 SDT/MoE 专家分工；
+        # 后期逐步减弱，让路由更多依靠图像特征。
         # ==========================================================
-        if self.input_condition:
-            real_moe_weights = []
+        if self.input_condition and expert_target is not None:
+            expert_target = expert_target.to(total_loss.device)
 
-            # 1. 遍历底层网络，精准拦截所有 MoE 层的真实微观权重
-            # 使用 unwrapped_model 防止 DDP 封装导致的类名识别失败
-            unwrapped_model = self.accelerator.unwrap_model(self.model) if hasattr(self, 'accelerator') else self.model
+            expert_prior_loss, balance_loss = self.compute_expert_prior_loss(
+                expert_target=expert_target,
+                sdt_weights=sdt_weights
+            )
 
-            for module in unwrapped_model.modules():
-                if type(module).__name__ == 'MoEResnetBlock':
-                    if hasattr(module, 'last_weights') and module.last_weights is not None:
-                        real_moe_weights.append(module.last_weights)
+            # 1) expert prior loss：按 step 衰减
+            if expert_prior_loss is not None:
+                lambda_expert_prior = self.get_expert_prior_weight(current_step)
+                total_loss = total_loss + lambda_expert_prior * expert_prior_loss
 
-            # 2. 计算全局真实的微观负载均衡
-            if len(real_moe_weights) > 0:
-                # [L, B, E]
-                moe_stack = torch.stack(real_moe_weights, dim=0)
-
-                # 每个样本在所有 MoE 层上的平均路由 [B, E]
-                routing_avg_per_sample = moe_stack.mean(dim=0)
-
-                # 全局平均负载 [E]
-                all_weights = torch.cat(real_moe_weights, dim=0)
-                mean_probs = all_weights.mean(dim=0)
-
-                # -----------------------------
-                # 1) expert prior loss
-                # -----------------------------
-                if expert_target is not None:
-                    eps = 1e-8
-                    expert_target = expert_target / expert_target.sum(dim=-1, keepdim=True).clamp_min(eps)
-
-                    loss_expert_prior = -(
-                            expert_target * torch.log(routing_avg_per_sample.clamp_min(eps))
-                    ).sum(dim=-1).mean()
-
-                    lambda_expert_prior = self.get_expert_prior_weight(current_step)
-
-                    total_loss = total_loss + lambda_expert_prior * loss_expert_prior
-
-                    self.last_expert_prior_loss = float(loss_expert_prior.detach().item())
-                    self.last_expert_prior_weight = float(lambda_expert_prior)
-                else:
-                    self.last_expert_prior_loss = None
-                    self.last_expert_prior_weight = None
-
-                # -----------------------------
-                # 2) load balance loss
-                # -----------------------------
-                bal_loss = 4.0 * torch.sum((mean_probs - 0.25) ** 2)
-
-                
-                base_bal_weight = 0.01
-
-                if current_step < 6000:
-                    bal_weight = base_bal_weight
-                elif current_step < 14000:
-                    alpha = (current_step - 6000) / float(14000 - 6000)
-                    bal_weight = base_bal_weight * (1.0 - 0.7 * alpha)
-                else:
-                    bal_weight = base_bal_weight * 0.15
-
-                if current_step % 1000 == 0 and current_step != self.last_print_step:
-                    print(
-                        f"[MoE负载] step={current_step} mean_probs={mean_probs.detach().cpu().numpy()} "
-                        f"bal_weight={bal_weight:.5f} "
-                        f"expert_prior={self.last_expert_prior_loss if self.last_expert_prior_loss is not None else 'None'} "
-                        f"lambda_prior={self.last_expert_prior_weight if self.last_expert_prior_weight is not None else 'None'}"
-                    )
-                    self.last_print_step = current_step
-
-                total_loss = total_loss + bal_weight * bal_loss
+                self.last_expert_prior_loss = float(expert_prior_loss.detach().item())
+                self.last_expert_prior_weight = float(lambda_expert_prior)
             else:
                 self.last_expert_prior_loss = None
                 self.last_expert_prior_weight = None
 
+            # 2) weak load balance：只防止塌缩，不强行均匀
+            if balance_loss is not None:
+                lambda_balance = self.get_balance_weight(current_step)
+                total_loss = total_loss + lambda_balance * balance_loss
+            else:
+                lambda_balance = None
 
+            # 3) 打印检查
+            if current_step % 1000 == 0 and current_step != self.last_print_step:
+                moe_weights = self.collect_moe_weights()
+                if len(moe_weights) > 0:
+                    all_weights = torch.cat(moe_weights, dim=0)
+                    mean_probs = all_weights.mean(dim=0).detach().cpu().numpy()
+                else:
+                    mean_probs = None
+
+                print(
+                    f"[MoE监督] step={current_step} "
+                    f"mean_probs={mean_probs} "
+                    f"expert_prior={self.last_expert_prior_loss} "
+                    f"lambda_prior={self.last_expert_prior_weight} "
+                    f"balance={float(balance_loss.detach().item()) if balance_loss is not None else None} "
+                    f"lambda_balance={lambda_balance}"
+                )
+                self.last_print_step = current_step
+
+        else:
+            self.last_expert_prior_loss = None
+            self.last_expert_prior_weight = None
 
         return total_loss
 
@@ -1744,13 +1719,16 @@ class Trainer(object):
         return "Unknown"
 
     def is_public_benchmark(self, dataset_name):
-        """
-        公开 benchmark 按 MCDFormer benchmark=True 逻辑走:
-            shave = scale
-        自定义验证集（例如 DF2KVal）按 benchmark=False 逻辑走:
-            shave = scale + 6
-        """
-        public_sets = {"Set5", "Set14", "BSDS100", "Urban100", "manga109", "Manga109"}
+        public_sets = {
+            "DF2KVal",
+            "Set5",
+            "Set14",
+            "B100",
+            "BSDS100",
+            "Urban100",
+            "manga109",
+            "Manga109"
+        }
         return dataset_name in public_sets
 
     def quantize_255(self, img):
@@ -2075,17 +2053,6 @@ class Trainer(object):
         return "Unknown"
 
 
-    def is_benchmark_metric(self, dataset_name):
-        """
-        为了和 MCDFormer benchmark 口径一致：
-        Set5 / Set14 / B100 / BSDS100 / Urban100 使用 benchmark=True。
-        DF2KVal 如果你也放在 benchmark/DF2KVal/HR 下，为了验证口径统一，也可设为 True。
-        """
-        benchmark_sets = {
-            "Set5", "Set14", "B100", "BSDS100", "Urban100", "DF2KVal"
-        }
-        return dataset_name in benchmark_sets
-
 
     def quantize_255(self, img):
         """
@@ -2251,9 +2218,6 @@ class Trainer(object):
 
             # 保证尺寸能整除 scale
             scale = 4
-            gt, pred = self.crop_pair_to_scale(pred, gt, scale)[1], self.crop_pair_to_scale(pred, gt, scale)[0]
-            # 上面写法太绕的话，也可拆成：
-            # pred, gt = self.crop_pair_to_scale(pred, gt, scale)
 
             pred, gt = self.crop_pair_to_scale(pred, gt, scale)
 

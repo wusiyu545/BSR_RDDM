@@ -179,7 +179,9 @@ if __name__ == "__main__":
             print("⚠️ [警告] test_gt 与 test_input 数量不一致，请确认测试集配对。")
 
     results_dir = "./results/MoE_SDT_BlindSR_x4_DF2K_alignMCD"
-
+    VAL_SIGMA = 0.0
+    os.environ["MOE_EVAL_SIGMA"] = str(VAL_SIGMA)
+    print(f"[Validation Config] VAL_SIGMA={VAL_SIGMA}")
     trainer = Trainer(
         diffusion,
         folder,
@@ -198,6 +200,7 @@ if __name__ == "__main__":
         crop_patch=True,
         generation=False,
         results_folder=results_dir
+        
     )
 
     if trainer.accelerator.is_local_main_process:

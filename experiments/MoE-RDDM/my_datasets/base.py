@@ -30,25 +30,41 @@ def _random_iso_gaussian_kernel(kernel_size=21, sig_min=0.2, sig_max=4.0):
     kernel /= max(kernel.sum(), 1e-12)
     return kernel, sigma
 
+def _fixed_iso_gaussian_kernel(kernel_size=21, sigma=0.0):
+    """
+    验证 / 测试阶段使用固定 sigma。
+    sigma=0 表示 pure bicubic x4；
+    sigma>0 表示 fixed iso Gaussian blur + bicubic x4。
+    """
+    sigma = float(sigma)
+    if sigma <= 0:
+        return None
+
+    k1d = cv2.getGaussianKernel(kernel_size, sigma)
+    kernel = np.outer(k1d, k1d).astype(np.float32)
+    kernel /= max(kernel.sum(), 1e-12)
+    return kernel
+
+
+
 
 def build_expert_target_sr_x4(sigma):
     """
-    按 blur sigma 强度给 4 个专家做 soft target
-    对齐 MCDFormer 后，不再按 JPEG / noise / motion blur 分专家，
-    而是按模糊强度分桶。
+    sigma soft target:
+    E0: very mild / bicubic-like blur
+    E1: sigma around 1.2
+    E2: sigma around 2.4
+    E3: sigma around 3.6
 
-    E0: very mild blur
-    E1: mild-medium blur
-    E2: medium-strong blur
-    E3: strong blur
+    注意：不要用 hard one-hot，因为 sigma 是连续变量。
     """
-    sigma = float(np.clip(sigma, 0.2, 4.0))
+    sigma = float(np.clip(sigma, 0.0, 4.0))
 
-    centers = np.array([0.6, 1.4, 2.4, 3.5], dtype=np.float32)
-    widths = np.array([0.45, 0.50, 0.60, 0.65], dtype=np.float32)
+    centers = np.array([0.4, 1.2, 2.4, 3.6], dtype=np.float32)
+    widths = np.array([0.55, 0.60, 0.65, 0.70], dtype=np.float32)
 
     weights = np.exp(-0.5 * ((sigma - centers) / widths) ** 2).astype(np.float32)
-    weights += 1e-3
+    weights += 1e-4
     weights /= weights.sum()
 
     return weights.astype(np.float32)
@@ -74,6 +90,14 @@ class Dataset(TorchDataset):
         self.blur_kernel_size = 21
         self.sig_min = 0.2
         self.sig_max = 4.0
+        # 验证 / 测试固定退化强度
+        # 由 train.py / test.py 通过环境变量传入
+        # 0.0  -> pure bicubic x4
+        # 1.2  -> Gaussian blur sigma=1.2 + bicubic x4
+        # 2.4  -> Gaussian blur sigma=2.4 + bicubic x4
+        # 3.6  -> Gaussian blur sigma=3.6 + bicubic x4
+        self.eval_sigma = float(os.environ.get("MOE_EVAL_SIGMA", "0.0"))
+
 
         self.equalizeHist = equalizeHist
         self.exts = tuple([e.lower() for e in exts])
@@ -109,28 +133,44 @@ class Dataset(TorchDataset):
         return len(self.paths)
 
 
+
     def degrade_for_eval_bicubic_x4(self, img_gt):
         """
-        验证 / 测试对齐 MCDFormer 的 bicubic x4 benchmark:
-        - 不加 blur
-        - 不加 noise
-        - 不加 JPEG
-        - 只做 bicubic x4 下采样
-        - 再 bicubic 上采样回 GT 尺寸，兼容当前 RDDM 同尺寸条件输入
+        验证 / 测试对齐 MCDFormer:
+        eval_sigma = 0:
+            pure bicubic x4
+        eval_sigma > 0:
+            fixed iso Gaussian blur(eval_sigma) + bicubic x4
+
+        当前 RDDM 条件输入要求和 GT 同尺寸，所以最后把 LR 再 bicubic 上采样回 GT 尺寸。
         """
         img = img_gt.astype(np.float32)
         h, w = img.shape[:2]
 
+        # 1) fixed iso Gaussian blur
+        kernel = _fixed_iso_gaussian_kernel(
+            kernel_size=self.blur_kernel_size,
+            sigma=self.eval_sigma
+        )
+        if kernel is not None:
+            img = cv2.filter2D(img, -1, kernel)
+
+        # 2) bicubic x4 downsample
         lr_w = max(1, w // self.sr_scale)
         lr_h = max(1, h // self.sr_scale)
-
         img_lr = cv2.resize(img, (lr_w, lr_h), interpolation=cv2.INTER_CUBIC)
+
+        # 3) quantize
         img_lr = np.clip(np.round(img_lr), 0, 255).astype(np.uint8)
 
+        # 4) upsample back to GT size
         img_lq_up = cv2.resize(img_lr, (w, h), interpolation=cv2.INTER_CUBIC)
         img_lq_up = np.ascontiguousarray(img_lq_up)
 
         return img_lq_up
+
+
+
 
     def degrade_for_blind_sr_x4(self, img_gt):
         """
@@ -183,11 +223,10 @@ class Dataset(TorchDataset):
                 # 只从 GT/HR 读图，不再依赖外部 input 图
                 img0 = self.pad_img([img0_pil], self.image_size)[0]
 
-                # 验证 / 测试时不要随机 crop
-                if self.crop_patch:
-                    img0 = self.get_patch([img0], self.image_size)[0]
+                # 验证 / 测试时不随机 crop，先 crop 到能被 scale 整除
+                img0 = self.crop_to_scale(img0, self.sr_scale)
 
-                # 在线生成 bicubic x4 输入
+                # 在线生成 fixed sigma + bicubic x4 输入
                 img1 = self.degrade_for_eval_bicubic_x4(img0)
 
                 if self.equalizeHist:
@@ -369,6 +408,16 @@ class Dataset(TorchDataset):
         if h != target_size or w != target_size:
             img = cv2.resize(img, (target_size, target_size), interpolation=cv2.INTER_CUBIC)
         return img
+
+    def crop_to_scale(self, img, scale=4):
+        """
+        对齐 MCDFormer 的 crop_border：
+        在验证 / 测试退化前，先把 HR crop 到能被 scale 整除。
+        """
+        h, w = img.shape[:2]
+        h = int(h // scale * scale)
+        w = int(w // scale * scale)
+        return img[:h, :w, :]
 
     def pad_img(self, img_list, patch_size, block_size=8):
         out = []
