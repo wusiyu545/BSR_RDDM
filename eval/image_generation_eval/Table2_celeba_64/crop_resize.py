@@ -7,7 +7,7 @@ from PIL import Image
 input_folder = '/home/liu/disk12t/liu_data/dataset/CelebA/test'
 output_folder = '/home/liu/disk12t/liu_data/dataset/CelebA/img_align_celeba_test_crop_256x256'
 
-img_size = 512
+img_size = 256
 
 # 如果输出文件夹不存在，则创建这个文件夹
 if not os.path.exists(output_folder):

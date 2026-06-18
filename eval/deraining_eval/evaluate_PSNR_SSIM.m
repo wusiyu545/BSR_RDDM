@@ -18,11 +18,8 @@ delete(gcp('nocreate'))
 % parpool('local',20);
 
 for idx_set = 1:num_set
-    % ==================== 重点修改了下面两行路径 ====================
-    file_path = 'E:\RDDM\experiments\strength1\2_Image_Restoration_deraing_raindrop_noise1\results\test_timestep_100pt_10\';
-    gt_path = 'E:\RDDM\experiments\strength1\2_Image_Restoration_deraing_raindrop_noise1\data\test_a\gt\';
-    % ================================================================
-    
+    file_path = '/home/backup/program_results/diffusion/去雨/raindrop_dataset/其他方法/WeatherDiffusion/';
+    gt_path = '/home/backup/program_results/diffusion/dataset/raindrop/gt/';
     path_list = [dir(strcat(file_path,'*.jpg')); dir(strcat(file_path,'*.png'))];
     gt_list = [dir(strcat(gt_path,'*.jpg')); dir(strcat(gt_path,'*.png'))];
     img_num = length(path_list);
@@ -59,7 +56,6 @@ fprintf('For all datasets PSNR: %f SSIM: %f\n', psnr_alldatasets/num_set, ssim_a
 delete(gcp('nocreate'))
 toc
 
-% ======== 下方的辅助函数 (compute_ssim, compute_psnr 等) 保持原样 ========
 function ssim_mean=compute_ssim(img1,img2)
     if size(img1, 3) == 3
         img1 = rgb2ycbcr(img1);
@@ -92,7 +88,79 @@ function psnr=compute_psnr(img1,img2)
 end
 
 function [mssim, ssim_map] = SSIM_index(img1, img2, K, window, L)
-% (保持原始代码不变...)
+
+%========================================================================
+%SSIM Index, Version 1.0
+%Copyright(c) 2003 Zhou Wang
+%All Rights Reserved.
+%
+%The author is with Howard Hughes Medical Institute, and Laboratory
+%for Computational Vision at Center for Neural Science and Courant
+%Institute of Mathematical Sciences, New York University.
+%
+%----------------------------------------------------------------------
+%Permission to use, copy, or modify this software and its documentation
+%for educational and research purposes only and without fee is hereby
+%granted, provided that this copyright notice and the original authors'
+%names appear on all copies and supporting documentation. This program
+%shall not be used, rewritten, or adapted as the basis of a commercial
+%software or hardware product without first obtaining permission of the
+%authors. The authors make no representations about the suitability of
+%this software for any purpose. It is provided "as is" without express
+%or implied warranty.
+%----------------------------------------------------------------------
+%
+%This is an implementation of the algorithm for calculating the
+%Structural SIMilarity (SSIM) index between two images. Please refer
+%to the following paper:
+%
+%Z. Wang, A. C. Bovik, H. R. Sheikh, and E. P. Simoncelli, "Image
+%quality assessment: From error measurement to structural similarity"
+%IEEE Transactios on Image Processing, vol. 13, no. 1, Jan. 2004.
+%
+%Kindly report any suggestions or corrections to zhouwang@ieee.org
+%
+%----------------------------------------------------------------------
+%
+%Input : (1) img1: the first image being compared
+%        (2) img2: the second image being compared
+%        (3) K: constants in the SSIM index formula (see the above
+%            reference). defualt value: K = [0.01 0.03]
+%        (4) window: local window for statistics (see the above
+%            reference). default widnow is Gaussian given by
+%            window = fspecial('gaussian', 11, 1.5);
+%        (5) L: dynamic range of the images. default: L = 255
+%
+%Output: (1) mssim: the mean SSIM index value between 2 images.
+%            If one of the images being compared is regarded as 
+%            perfect quality, then mssim can be considered as the
+%            quality measure of the other image.
+%            If img1 = img2, then mssim = 1.
+%        (2) ssim_map: the SSIM index map of the test image. The map
+%            has a smaller size than the input images. The actual size:
+%            size(img1) - size(window) + 1.
+%
+%Default Usage:
+%   Given 2 test images img1 and img2, whose dynamic range is 0-255
+%
+%   [mssim ssim_map] = ssim_index(img1, img2);
+%
+%Advanced Usage:
+%   User defined parameters. For example
+%
+%   K = [0.05 0.05];
+%   window = ones(8);
+%   L = 100;
+%   [mssim ssim_map] = ssim_index(img1, img2, K, window, L);
+%
+%See the results:
+%
+%   mssim                        %Gives the mssim value
+%   imshow(max(0, ssim_map).^4)  %Shows the SSIM index map
+%
+%========================================================================
+
+
 if (nargin < 2 || nargin > 5)
    ssim_index = -Inf;
    ssim_map = -Inf;
