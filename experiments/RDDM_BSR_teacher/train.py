@@ -87,10 +87,11 @@ def parse_args():
     # Precision and data processing
     parser.add_argument("--amp", action="store_true",
                         help="Enable native AMP in Trainer.")
-    parser.add_argument("--crop_patch", action="store_true",
-                        help="Random crop paired HR/LQ_up patches during training. Recommended for DF2K.")
-    parser.add_argument("--no_crop_patch", action="store_true",
-                        help="Disable random crop. This overrides --crop_patch.")
+    parser.set_defaults(crop_patch=True)
+    parser.add_argument("--crop_patch", dest="crop_patch", action="store_true",
+                        help="Enable random crop for paired HR/LQ_up patches during training. Default: enabled.")
+    parser.add_argument("--no_crop_patch", dest="crop_patch", action="store_false",
+                        help="Disable random crop. Use this only for full-image training or testing.")
     parser.add_argument("--equalize_hist", action="store_true",
                         help="Use histogram equalization for input images. Normally keep False for BSR.")
     parser.add_argument("--convert_image_to", type=str, default="RGB",
@@ -170,10 +171,6 @@ def main():
 
     diffusion, condition = build_diffusion(args)
 
-    crop_patch = args.crop_patch
-    if args.no_crop_patch:
-        crop_patch = False
-
     trainer = Trainer(
         diffusion,
         folder,
@@ -188,7 +185,7 @@ def main():
         condition=condition,
         save_and_sample_every=args.save_every,
         equalizeHist=args.equalize_hist,
-        crop_patch=crop_patch,
+        crop_patch=args.crop_patch,
         generation=False,
         results_folder=args.save_dir,
     )
