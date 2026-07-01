@@ -301,6 +301,18 @@ def main():
     if trainer.accelerator.is_local_main_process and args.resume > 0:
         trainer.load(args.resume)
 
+        # Force reset learning rate after loading optimizer state.
+        for param_group in trainer.opt.param_groups:
+            param_group["lr"] = args.lr
+
+        print(f"[resume] reset optimizer lr to {args.lr}")
+
+        # Force reset learning rate after loading optimizer state.
+        for param_group in trainer.opt.param_groups:
+            param_group["lr"] = args.lr
+
+        print(f"[resume] reset optimizer lr to {args.lr}")
+    
     trainer.train()
 
     if args.test_after_train:
